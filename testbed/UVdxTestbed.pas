@@ -1,4 +1,4 @@
-unit UVdxTestbed;
+﻿unit UVdxTestbed;
 
 interface
 
@@ -8,6 +8,7 @@ implementation
 
 uses
   System.SysUtils,
+  System.IOUtils,
   VindexLLM.Utils,
   VindexLLM.VulkanCompute;
 
@@ -175,16 +176,124 @@ begin
   end;
 end;
 
+// ============================================================================
+//  Test 03 — GPU compute round-trip with SPIR-V loaded from disk
+// ============================================================================
+
+procedure Test03();
+const
+  CFloatCount = 4;
+  CBufferSize = CFloatCount * SizeOf(Single);
+  CInputData: array[0..CFloatCount - 1] of Single = (1.0, 2.0, 3.0, 4.0);
+  CExpected:  array[0..CFloatCount - 1] of Single = (2.0, 4.0, 6.0, 8.0);
+var
+  LCompute: TVdxVulkanCompute;
+  LBuffer: TVdxGpuBuffer;
+  LShader: VkShaderModule;
+  LDescLayout: VkDescriptorSetLayout;
+  LPipeline: TVdxComputePipelineBundle;
+  LDescPool: VkDescriptorPool;
+  LDescSet: VkDescriptorSet;
+  LOutput: array[0..CFloatCount - 1] of Single;
+  LSpvPath: string;
+  LSpvBytes: TBytes;
+  LI: Integer;
+  LPassed: Boolean;
+begin
+  LCompute := TVdxVulkanCompute.Create();
+  try
+    LCompute.SetStatusCallback(StatusCallback);
+    LCompute.Init();
+
+    // Resolve path to .spv relative to exe location
+    LSpvPath := TPath.Combine(
+      TPath.GetDirectoryName(ParamStr(0)),
+      '..\shaders\double_floats.spv'
+    );
+    LSpvPath := TPath.GetFullPath(LSpvPath);
+
+    TVdxUtils.PrintLn('Loading SPIR-V from: %s', [LSpvPath]);
+    TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
+      'SPIR-V file not found: %s', [LSpvPath]);
+
+    LSpvBytes := TFile.ReadAllBytes(LSpvPath);
+    TVdxUtils.PrintLn('Loaded %d bytes of SPIR-V', [Length(LSpvBytes)]);
+
+    // Create buffer and upload
+    LBuffer := LCompute.CreateGpuBuffer(
+      CBufferSize,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    );
+    TVdxUtils.PrintLn('Uploading [%.1f, %.1f, %.1f, %.1f]...',
+      [CInputData[0], CInputData[1], CInputData[2], CInputData[3]]);
+    LCompute.UploadToBuffer(LBuffer, @CInputData[0], CBufferSize);
+
+    // Create shader from file bytes
+    LShader := LCompute.CreateShaderModule(@LSpvBytes[0], NativeUInt(Length(LSpvBytes)));
+
+    // Pipeline setup
+    LDescLayout := LCompute.CreateStorageDescriptorSetLayout(1);
+    LPipeline := LCompute.CreateComputePipelineSimple(LShader, 'main', LDescLayout);
+    LDescPool := LCompute.CreateDescriptorPoolForStorage(1, 1);
+    LDescSet := LCompute.AllocateDescriptorSetForBuffers(LDescPool, LDescLayout, [LBuffer]);
+
+    // Dispatch
+    TVdxUtils.PrintLn('Dispatching compute shader (1 workgroup)...');
+    LCompute.DispatchCompute(
+      LPipeline.Pipeline,
+      LPipeline.PipelineLayout,
+      LDescSet,
+      1
+    );
+
+    // Download and verify
+    FillChar(LOutput, SizeOf(LOutput), 0);
+    LCompute.DownloadFromBuffer(LBuffer, @LOutput[0], CBufferSize);
+
+    TVdxUtils.PrintLn('Result: [%.1f, %.1f, %.1f, %.1f]',
+      [LOutput[0], LOutput[1], LOutput[2], LOutput[3]]);
+
+    LPassed := True;
+    for LI := 0 to CFloatCount - 1 do
+    begin
+      if Abs(LOutput[LI] - CExpected[LI]) > 0.001 then
+      begin
+        TVdxUtils.PrintLn(COLOR_RED + 'MISMATCH at [%d]: expected %.1f, got %.1f',
+          [LI, CExpected[LI], LOutput[LI]]);
+        LPassed := False;
+      end;
+    end;
+
+    if LPassed then
+      TVdxUtils.PrintLn(COLOR_GREEN + 'TEST 03 PASSED: File-loaded SPIR-V round-trip verified!')
+    else
+      TVdxUtils.PrintLn(COLOR_RED + 'TEST 03 FAILED: Output mismatch');
+
+    // Cleanup
+    LCompute.DestroyDescriptorPoolHandle(LDescPool);
+    LCompute.DestroyComputePipelineBundle(LPipeline);
+    LCompute.DestroyDescriptorSetLayoutHandle(LDescLayout);
+    LCompute.DestroyShaderModuleHandle(LShader);
+    LCompute.DestroyGpuBuffer(LBuffer);
+
+    TVdxUtils.Pause();
+  finally
+    LCompute.Free();
+  end;
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
 begin
   try
-    LIndex := 2;
+    LIndex := 3;
 
     case LIndex of
       1: Test01();
       2: Test02();
+      3: Test03();
     end;
   except
     on E: Exception do

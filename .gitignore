@@ -78,6 +78,16 @@ __recovery/
 # Castalia statistics file (since XE7 Castalia is distributed with Delphi)
 *.stat
 
+# Compiled SPIR-V shaders (rebuild from .comp via shaders/compile.cmd)
+*.spv
+
 # Boss dependency manager vendor folder https://github.com/HashLoad/boss
 modules/
 /.claude
+_checkpoint.cmd
+_checkpoint_base.cmd
+_distro.cmd
+checkpoint.yml
+checkpoint.zip
+checkpoint_base.zip
+distro.yml
