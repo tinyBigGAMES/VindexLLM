@@ -528,9 +528,10 @@ begin
             Double(LValHi) * Double(PSingle(PByte(FResidualMapped) + UInt64(LDim) * 8 + 4)^);
         end;
 
-        // SiLU(gate_score) * up_dot
+        // GELU-tanh(gate_score) * up_dot
         LGateScore := Double(LTopValues[LK]);
-        LSilu := LGateScore / (1.0 + Exp(-LGateScore));
+        LSilu := 0.5 * LGateScore * (1.0 + Tanh(
+          0.7978845608 * (LGateScore + 0.044715 * LGateScore * LGateScore * LGateScore)));
         LTopValues[LK] := Single(LSilu * LUpDot);
       end;
     end;

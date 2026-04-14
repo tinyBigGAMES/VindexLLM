@@ -9,6 +9,7 @@ implementation
 uses
   System.SysUtils,
   System.IOUtils,
+  System.Math,
   VindexLLM.Utils,
   VindexLLM.VulkanCompute,
   VindexLLM.GGUFReader,
@@ -933,8 +934,9 @@ const
   CHeadDim   = 256;
   CNumLayers = 34;
   CMaxSeqLen = 32;
-  CTopK      = 128;
+  CTopK      = 2048;
   CEnableAttn = True;
+  CUseKNNWalk = False;
   CVocabSize = 262144;
 
   // Gemma 3 IT chat template — hardcoded token IDs from Python tokenizer
@@ -1264,6 +1266,13 @@ begin
     LElapsed := TVdxUtils.GetTickCount64() - LStartTick;
     TVdxUtils.PrintLn('  All weights uploaded (%d ms)', [LElapsed]);
 
+    // Init KNN walk engine (if enabled)
+    if CUseKNNWalk then
+    begin
+      LWalk.Init(LCompute, CHiddenDim, CFFNWidth, CTopK);
+      TVdxUtils.PrintLn(COLOR_YELLOW + '  KNN walk enabled (K=%d / %d)', [CTopK, CFFNWidth]);
+    end;
+
     // ==================================================================
     //  Phase 3: Tokenize the prompt using proper BPE tokenizer
     // ==================================================================
@@ -1372,8 +1381,7 @@ begin
         end; // if CEnableAttn
 
         // ============================================================
-        //  FFN branch: x = x + PostFFNNorm(down(GELU(gate(x)) * up(x)))
-        //  Dense standard transformer FFN using matvec_f16 shader
+        //  FFN branch: x = x + PostFFNNorm(FFN(PreFFNNorm(x)))
         // ============================================================
 
         // Save residual for the residual connection
@@ -1383,31 +1391,53 @@ begin
         LCompute.UploadToBuffer(LWorkBufA, @LResidual[0], LBufSize);
         LNorm.Apply(LWorkBufA, LNormWeights[LLayer].FFNNormGpu, CHiddenDim);
 
-        // gate(x) → LGateBuf [10240]
-        LAttn.TestMatVec(LVindex.GetLayer(LLayer).GateGpuBuffer,
-          LWorkBufA, LGateBuf, CHiddenDim, CFFNWidth);
+        if CUseKNNWalk then
+        begin
+          // --- KNN walk path ---
+          // Download normed input from GPU
+          LCompute.DownloadFromBuffer(LWorkBufA, @LNormedInput[0], LBufSize);
 
-        // up(x) → LUpBuf [10240]
-        LAttn.TestMatVec(LUpWeights[LLayer],
-          LWorkBufA, LUpBuf, CHiddenDim, CFFNWidth);
+          // Set normed input as walk residual, run walk
+          LWalk.SetResidual(@LNormedInput[0]);
+          LWalk.WalkLayer(LVindex.GetLayer(LLayer));
 
-        // GELU(gate) * up → LGateBuf [10240] in-place
-        LSiluMulPush.Count := CFFNWidth;
-        LSiluDescPool := LCompute.CreateDescriptorPoolForStorage(1, 2);
-        try
-          LSiluDescSet := LCompute.AllocateDescriptorSetForBuffers(
-            LSiluDescPool, LSiluMulDescLayout, [LGateBuf, LUpBuf]);
-          LCompute.DispatchComputeWithPush(
-            LSiluMulBundle.Pipeline, LSiluMulBundle.PipelineLayout,
-            LSiluDescSet, @LSiluMulPush, SizeOf(LSiluMulPush),
-            (CFFNWidth + 255) div 256);
-        finally
-          LCompute.DestroyDescriptorPoolHandle(LSiluDescPool);
+          // Get result (normed_input + knn_ffn_output), extract FFN output
+          LWalk.GetResidual(@LTempVec[0]);
+          for LI := 0 to CHiddenDim - 1 do
+            LTempVec[LI] := LTempVec[LI] - LNormedInput[LI];
+
+          // Upload FFN output to GPU for PostFFNNorm
+          LCompute.UploadToBuffer(LFFNOutBuf, @LTempVec[0], LBufSize);
+        end
+        else
+        begin
+          // --- Dense path ---
+          // gate(x) → LGateBuf [10240]
+          LAttn.TestMatVec(LVindex.GetLayer(LLayer).GateGpuBuffer,
+            LWorkBufA, LGateBuf, CHiddenDim, CFFNWidth);
+
+          // up(x) → LUpBuf [10240]
+          LAttn.TestMatVec(LUpWeights[LLayer],
+            LWorkBufA, LUpBuf, CHiddenDim, CFFNWidth);
+
+          // GELU(gate) * up → LGateBuf [10240] in-place
+          LSiluMulPush.Count := CFFNWidth;
+          LSiluDescPool := LCompute.CreateDescriptorPoolForStorage(1, 2);
+          try
+            LSiluDescSet := LCompute.AllocateDescriptorSetForBuffers(
+              LSiluDescPool, LSiluMulDescLayout, [LGateBuf, LUpBuf]);
+            LCompute.DispatchComputeWithPush(
+              LSiluMulBundle.Pipeline, LSiluMulBundle.PipelineLayout,
+              LSiluDescSet, @LSiluMulPush, SizeOf(LSiluMulPush),
+              (CFFNWidth + 255) div 256);
+          finally
+            LCompute.DestroyDescriptorPoolHandle(LSiluDescPool);
+          end;
+
+          // down(hidden) → LFFNOutBuf [2560]
+          LAttn.TestMatVec(LVindex.GetLayer(LLayer).DownGpuBuffer,
+            LGateBuf, LFFNOutBuf, CFFNWidth, CHiddenDim);
         end;
-
-        // down(hidden) → LFFNOutBuf [2560]
-        LAttn.TestMatVec(LVindex.GetLayer(LLayer).DownGpuBuffer,
-          LGateBuf, LFFNOutBuf, CFFNWidth, CHiddenDim);
 
         // Apply PostFFNNorm to FFN output
         LNorm.Apply(LFFNOutBuf,
@@ -2956,6 +2986,294 @@ begin
   end;
 end;
 
+// ============================================================================
+//  Test_KNNvsDense — Compare KNN-walk FFN against dense FFN for layer 0
+//  Tests multiple K values to show quality vs sparsity tradeoff
+// ============================================================================
+
+procedure Test_KNNvsDense();
+const
+  CGGUFPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
+  CHiddenDim = 2560;
+  CFFNWidth = 10240;
+  CKValues: array[0..5] of Integer = (64, 128, 256, 512, 1024, 2048);
+var
+  LReader: TVdxGGUFReader;
+  LCompute: TVdxVulkanCompute;
+  LNorm: TVdxLayerNorm;
+  LVindex: TVdxVindex;
+  LWalk: TVdxKNNWalk;
+  LResidual: array of Single;
+  LNormedInput: array of Single;
+  LGateOut: array of Single;
+  LUpOut: array of Single;
+  LDenseOut: array of Single;
+  LKNNResult: array of Single;
+  LKNNOut: array of Single;
+  LEmbedPtr: PByte;
+  LGatePtr: PByte;
+  LUpPtr: PByte;
+  LDownPtr: PByte;
+  LNormWeightPtr: Pointer;
+  LNormWeightData: array of Single;
+  LBosTokenId: Integer;
+  LEmbedScale: Single;
+  LBufSize: UInt64;
+  LNormBuf: TVdxGpuBuffer;
+  LResBuf: TVdxGpuBuffer;
+  LI: Integer;
+  LJ: Integer;
+  LK: Integer;
+  LKIdx: Integer;
+  LAcc: Double;
+  LSumSq: Double;
+  LRms: Double;
+  LGelu: Double;
+  LInner: Double;
+  LGateVal: Double;
+  LL2Dense: Double;
+  LL2KNN: Double;
+  LL2Diff: Double;
+  LCosNum: Double;
+  LCosDenA: Double;
+  LCosDenB: Double;
+  LCosSim: Double;
+  LMaxErr: Double;
+  LErr: Double;
+
+  function F16ToF32(const AVal: UInt16): Single;
+  const
+    CSignBit: UInt32 = $80000000;
+  var
+    LExp: UInt32;
+    LMant: UInt32;
+    LBits: UInt32;
+  begin
+    LExp := (UInt32(AVal) shr 10) and $1F;
+    LMant := UInt32(AVal) and $3FF;
+    if LExp = 0 then
+    begin
+      if LMant = 0 then
+        LBits := 0
+      else
+      begin
+        LExp := 1;
+        while (LMant and $400) = 0 do
+        begin
+          LMant := LMant shl 1;
+          Inc(LExp);
+        end;
+        LMant := LMant and $3FF;
+        LBits := UInt32((113 - LExp) shl 23) or (LMant shl 13);
+      end;
+    end
+    else if LExp = $1F then
+      LBits := UInt32($FF shl 23) or (LMant shl 13)
+    else
+      LBits := UInt32((LExp + 112) shl 23) or (LMant shl 13);
+    if (AVal and $8000) <> 0 then
+      LBits := LBits or CSignBit;
+    Move(LBits, Result, 4);
+  end;
+
+begin
+  TVdxUtils.PrintLn(COLOR_CYAN + '=== Test_KNNvsDense: KNN-walk FFN vs Dense FFN ===');
+  TVdxUtils.PrintLn(COLOR_CYAN + '  Layer 0, BOS token, multiple K values');
+  TVdxUtils.PrintLn('');
+
+  LBufSize := UInt64(CHiddenDim) * SizeOf(Single);
+  LEmbedScale := Sqrt(Single(CHiddenDim));
+
+  LReader := TVdxGGUFReader.Create();
+  LCompute := TVdxVulkanCompute.Create();
+  LNorm := TVdxLayerNorm.Create();
+  LVindex := TVdxVindex.Create();
+  LWalk := nil;
+  try
+    LReader.SetStatusCallback(StatusCallback);
+    LCompute.SetStatusCallback(StatusCallback);
+
+    TVdxUtils.FailIf(not LReader.Open(CGGUFPath),
+      'Failed to open GGUF: %s', [CGGUFPath]);
+    LCompute.Init();
+    LNorm.Init(LCompute);
+    LVindex.BuildFromGGUF(LReader);
+    LVindex.UploadLayer(0, LCompute);
+
+    // ================================================================
+    //  Embed BOS + PreFFNNorm (CPU reference)
+    // ================================================================
+    LBosTokenId := Integer(LReader.GetMetadataUInt32(
+      'tokenizer.ggml.bos_token_id', 2));
+    LEmbedPtr := PByte(LReader.GetTensorDataPtr('token_embd.weight'));
+
+    SetLength(LResidual, CHiddenDim);
+    for LI := 0 to CHiddenDim - 1 do
+      LResidual[LI] := F16ToF32(PWord(LEmbedPtr +
+        UInt64(LBosTokenId) * UInt64(CHiddenDim) * 2 +
+        UInt64(LI) * 2)^) * LEmbedScale;
+
+    // RMSNorm on CPU (GGUF weight already has +1 offset)
+    LNormWeightPtr := LReader.GetTensorDataPtr('blk.0.ffn_norm.weight');
+    SetLength(LNormWeightData, CHiddenDim);
+    Move(LNormWeightPtr^, LNormWeightData[0], LBufSize);
+
+    LSumSq := 0.0;
+    for LI := 0 to CHiddenDim - 1 do
+      LSumSq := LSumSq + Double(LResidual[LI]) * Double(LResidual[LI]);
+    LRms := Sqrt(LSumSq / CHiddenDim + 1e-6);
+
+    SetLength(LNormedInput, CHiddenDim);
+    for LI := 0 to CHiddenDim - 1 do
+      LNormedInput[LI] := Single(
+        (Double(LResidual[LI]) / LRms) * Double(LNormWeightData[LI]));
+
+    LAcc := 0.0;
+    for LI := 0 to CHiddenDim - 1 do
+      LAcc := LAcc + Double(LNormedInput[LI]) * Double(LNormedInput[LI]);
+    TVdxUtils.PrintLn('  Normed input L2: %.4f', [Sqrt(LAcc)]);
+
+    // ================================================================
+    //  Dense FFN reference (CPU): down @ (GELU(gate @ x) * (up @ x))
+    // ================================================================
+    TVdxUtils.PrintLn('  Computing dense FFN reference (CPU)...');
+    LGatePtr := PByte(LReader.GetTensorDataPtr('blk.0.ffn_gate.weight'));
+    LUpPtr := PByte(LReader.GetTensorDataPtr('blk.0.ffn_up.weight'));
+    LDownPtr := PByte(LReader.GetTensorDataPtr('blk.0.ffn_down.weight'));
+
+    // Gate projection
+    SetLength(LGateOut, CFFNWidth);
+    for LI := 0 to CFFNWidth - 1 do
+    begin
+      LAcc := 0.0;
+      for LJ := 0 to CHiddenDim - 1 do
+        LAcc := LAcc + Double(F16ToF32(
+          PWord(LGatePtr + (UInt64(LI) * CHiddenDim + UInt64(LJ)) * 2)^)) *
+          Double(LNormedInput[LJ]);
+      LGateOut[LI] := Single(LAcc);
+    end;
+
+    // Up projection
+    SetLength(LUpOut, CFFNWidth);
+    for LI := 0 to CFFNWidth - 1 do
+    begin
+      LAcc := 0.0;
+      for LJ := 0 to CHiddenDim - 1 do
+        LAcc := LAcc + Double(F16ToF32(
+          PWord(LUpPtr + (UInt64(LI) * CHiddenDim + UInt64(LJ)) * 2)^)) *
+          Double(LNormedInput[LJ]);
+      LUpOut[LI] := Single(LAcc);
+    end;
+
+    // GELU(gate) * up → hidden
+    for LI := 0 to CFFNWidth - 1 do
+    begin
+      LGateVal := Double(LGateOut[LI]);
+      LInner := 0.7978845608 * (LGateVal + 0.044715 * LGateVal * LGateVal * LGateVal);
+      LGelu := 0.5 * LGateVal * (1.0 + Tanh(LInner));
+      LGateOut[LI] := Single(LGelu * Double(LUpOut[LI]));
+    end;
+
+    // Down projection
+    SetLength(LDenseOut, CHiddenDim);
+    for LI := 0 to CHiddenDim - 1 do
+    begin
+      LAcc := 0.0;
+      for LJ := 0 to CFFNWidth - 1 do
+        LAcc := LAcc + Double(F16ToF32(
+          PWord(LDownPtr + (UInt64(LI) * CFFNWidth + UInt64(LJ)) * 2)^)) *
+          Double(LGateOut[LJ]);
+      LDenseOut[LI] := Single(LAcc);
+    end;
+
+    LL2Dense := 0.0;
+    for LI := 0 to CHiddenDim - 1 do
+      LL2Dense := LL2Dense + Double(LDenseOut[LI]) * Double(LDenseOut[LI]);
+    LL2Dense := Sqrt(LL2Dense);
+    TVdxUtils.PrintLn('  Dense FFN output L2: %.4f', [LL2Dense]);
+    TVdxUtils.PrintLn('  Dense first 4: [%.6f, %.6f, %.6f, %.6f]',
+      [LDenseOut[0], LDenseOut[1], LDenseOut[2], LDenseOut[3]]);
+
+    // ================================================================
+    //  KNN walk at various K values
+    // ================================================================
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '  %5s  %10s  %10s  %10s  %10s',
+      ['K', 'KNN L2', 'Diff L2', 'CosSim', 'MaxErr']);
+    TVdxUtils.PrintLn(
+      '  %s', [StringOfChar('-', 55)]);
+
+    SetLength(LKNNResult, CHiddenDim);
+    SetLength(LKNNOut, CHiddenDim);
+
+    for LKIdx := 0 to High(CKValues) do
+    begin
+      LK := CKValues[LKIdx];
+
+      // Create fresh walk for this K
+      FreeAndNil(LWalk);
+      LWalk := TVdxKNNWalk.Create();
+      LWalk.SetStatusCallback(nil);
+      LWalk.Init(LCompute, CHiddenDim, CFFNWidth, LK);
+      LWalk.UseUpProjection := True;
+
+      // Set normed input as residual
+      LWalk.SetResidual(@LNormedInput[0]);
+
+      // Run KNN walk
+      LWalk.WalkLayer(LVindex.GetLayer(0));
+
+      // Get result (= normed_input + knn_ffn_output)
+      LWalk.GetResidual(@LKNNResult[0]);
+
+      // Extract just the KNN FFN output
+      for LI := 0 to CHiddenDim - 1 do
+        LKNNOut[LI] := LKNNResult[LI] - LNormedInput[LI];
+
+      // Compare
+      LL2KNN := 0.0;
+      LL2Diff := 0.0;
+      LCosNum := 0.0;
+      LCosDenA := 0.0;
+      LCosDenB := 0.0;
+      LMaxErr := 0.0;
+      for LI := 0 to CHiddenDim - 1 do
+      begin
+        LL2KNN := LL2KNN + Double(LKNNOut[LI]) * Double(LKNNOut[LI]);
+        LL2Diff := LL2Diff + Sqr(Double(LDenseOut[LI]) - Double(LKNNOut[LI]));
+        LCosNum := LCosNum + Double(LDenseOut[LI]) * Double(LKNNOut[LI]);
+        LCosDenA := LCosDenA + Double(LDenseOut[LI]) * Double(LDenseOut[LI]);
+        LCosDenB := LCosDenB + Double(LKNNOut[LI]) * Double(LKNNOut[LI]);
+        LErr := Abs(Double(LDenseOut[LI]) - Double(LKNNOut[LI]));
+        if LErr > LMaxErr then
+          LMaxErr := LErr;
+      end;
+      LL2KNN := Sqrt(LL2KNN);
+      LL2Diff := Sqrt(LL2Diff);
+      LCosSim := LCosNum / (Sqrt(LCosDenA) * Sqrt(LCosDenB) + 1e-12);
+
+      TVdxUtils.PrintLn('  %5d  %10.4f  %10.4f  %10.6f  %10.4f',
+        [LK, LL2KNN, LL2Diff, LCosSim, LMaxErr]);
+
+      LWalk.Cleanup();
+    end;
+
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Done.');
+
+    LVindex.FreeLayerGpu(0, LCompute);
+    LNorm.Cleanup();
+    LReader.Close();
+  finally
+    FreeAndNil(LWalk);
+    LVindex.Free();
+    LNorm.Free();
+    LCompute.Free();
+    LReader.Free();
+  end;
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
@@ -2978,6 +3296,7 @@ begin
       12: Test_AttnScores();
       13: Test_FFNCompare();
       14: Test_Basics();
+      15: Test_KNNvsDense();
     end;
   except
     on E: Exception do
