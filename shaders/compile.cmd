@@ -23,4 +23,10 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+%GLSLC% -V rmsnorm.comp -o rmsnorm.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: rmsnorm.comp
+    exit /b 1
+)
+
 echo Done.

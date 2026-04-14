@@ -13,7 +13,8 @@ uses
   VindexLLM.VulkanCompute,
   VindexLLM.GGUFReader,
   VindexLLM.Vindex,
-  VindexLLM.KNNWalk;
+  VindexLLM.KNNWalk,
+  VindexLLM.LayerNorm;
 
 // ============================================================================
 //  Embedded SPIR-V: "double every float" compute shader
@@ -575,12 +576,161 @@ begin
   end;
 end;
 
+// ============================================================================
+//  Test 07 — LayerNorm: RMSNorm on GPU vs CPU reference
+// ============================================================================
+
+procedure Test07();
+const
+  CGGUFPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
+var
+  LReader: TVdxGGUFReader;
+  LCompute: TVdxVulkanCompute;
+  LNorm: TVdxLayerNorm;
+  LNormWeights: TVdxNormLayerWeights;
+  LHiddenDim: UInt32;
+  LResidualBuf: TVdxGpuBuffer;
+  LResidualIn: array of Single;
+  LResidualGpu: array of Single;
+  LResidualCpu: array of Single;
+  LWeightData: array of Single;
+  LWeightPtr: Pointer;
+  LSumSq: Double;
+  LRms: Double;
+  LMaxErr: Double;
+  LErr: Double;
+  LI: Integer;
+  LPassed: Boolean;
+begin
+  TVdxUtils.PrintLn(COLOR_CYAN + '=== Test 07: LayerNorm — RMSNorm GPU vs CPU ===');
+  TVdxUtils.PrintLn('');
+
+  LReader := TVdxGGUFReader.Create();
+  LCompute := TVdxVulkanCompute.Create();
+  LNorm := TVdxLayerNorm.Create();
+  try
+    LReader.SetStatusCallback(StatusCallback);
+    LCompute.SetStatusCallback(StatusCallback);
+    LNorm.SetStatusCallback(StatusCallback);
+
+    // Open GGUF
+    TVdxUtils.FailIf(not LReader.Open(CGGUFPath),
+      'Failed to open GGUF: %s', [CGGUFPath]);
+
+    // Get hidden dim from metadata
+    LHiddenDim := LReader.GetMetadataUInt32(
+      'gemma3.embedding_length', 2560);
+    TVdxUtils.PrintLn('Hidden dim: %d', [LHiddenDim]);
+
+    // Init Vulkan + LayerNorm
+    LCompute.Init();
+    LNorm.Init(LCompute);
+
+    // Upload layer 0 norm weights
+    TVdxUtils.PrintLn('Uploading layer 0 norm weights...');
+    LNorm.UploadNormWeights(LReader, 0, LNormWeights);
+
+    // Create a test residual: ramp [1, 2, 3, ..., 2560] / 2560
+    SetLength(LResidualIn, LHiddenDim);
+    for LI := 0 to LHiddenDim - 1 do
+      LResidualIn[LI] := (LI + 1) / LHiddenDim;
+
+    // Upload residual to host-visible GPU buffer
+    LResidualBuf := LCompute.CreateGpuBuffer(
+      UInt64(LHiddenDim) * SizeOf(Single),
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    );
+    LCompute.UploadToBuffer(LResidualBuf, @LResidualIn[0],
+      UInt64(LHiddenDim) * SizeOf(Single));
+
+    // Apply RMSNorm on GPU
+    TVdxUtils.PrintLn('Applying RMSNorm on GPU...');
+    LNorm.Apply(LResidualBuf, LNormWeights.AttnNormGpu, LHiddenDim);
+
+    // Download GPU result
+    SetLength(LResidualGpu, LHiddenDim);
+    LCompute.DownloadFromBuffer(LResidualBuf, @LResidualGpu[0],
+      UInt64(LHiddenDim) * SizeOf(Single));
+
+    // Compute CPU reference
+    // 1. Read attn_norm weights from GGUF
+    LWeightPtr := LReader.GetTensorDataPtr('blk.0.attn_norm.weight');
+    SetLength(LWeightData, LHiddenDim);
+    Move(LWeightPtr^, LWeightData[0],
+      UInt64(LHiddenDim) * SizeOf(Single));
+
+    // 2. Compute RMS on CPU
+    SetLength(LResidualCpu, LHiddenDim);
+    LSumSq := 0.0;
+    for LI := 0 to LHiddenDim - 1 do
+      LSumSq := LSumSq + Double(LResidualIn[LI]) * Double(LResidualIn[LI]);
+    LRms := Sqrt(LSumSq / LHiddenDim + 1e-6);
+
+    for LI := 0 to LHiddenDim - 1 do
+      LResidualCpu[LI] := Single(
+        (Double(LResidualIn[LI]) / LRms) * Double(LWeightData[LI]));
+
+    // Compare GPU vs CPU
+    LMaxErr := 0.0;
+    LPassed := True;
+    for LI := 0 to LHiddenDim - 1 do
+    begin
+      LErr := Abs(Double(LResidualGpu[LI]) - Double(LResidualCpu[LI]));
+      if LErr > LMaxErr then
+        LMaxErr := LErr;
+      if LErr > 1e-3 then
+      begin
+        TVdxUtils.PrintLn(COLOR_RED +
+          '  MISMATCH [%d]: GPU=%.8f CPU=%.8f err=%.8f',
+          [LI, LResidualGpu[LI], LResidualCpu[LI], LErr]);
+        LPassed := False;
+        if LI > 10 then
+        begin
+          TVdxUtils.PrintLn('  ... (showing first 10 mismatches)');
+          Break;
+        end;
+      end;
+    end;
+
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_GREEN + '--- Results ---');
+    TVdxUtils.PrintLn('  RMS (CPU):    %.8f', [LRms]);
+    TVdxUtils.PrintLn('  Max error:    %.10f', [LMaxErr]);
+    TVdxUtils.PrintLn('  First 4 GPU:  [%.6f, %.6f, %.6f, %.6f]',
+      [LResidualGpu[0], LResidualGpu[1], LResidualGpu[2],
+       LResidualGpu[3]]);
+    TVdxUtils.PrintLn('  First 4 CPU:  [%.6f, %.6f, %.6f, %.6f]',
+      [LResidualCpu[0], LResidualCpu[1], LResidualCpu[2],
+       LResidualCpu[3]]);
+
+    if LPassed then
+      TVdxUtils.PrintLn(COLOR_GREEN +
+        'TEST 07 PASSED: RMSNorm GPU matches CPU (max err=%.2e)',
+        [LMaxErr])
+    else
+      TVdxUtils.PrintLn(COLOR_RED +
+        'TEST 07 FAILED: RMSNorm GPU/CPU mismatch');
+
+    // Cleanup
+    LCompute.DestroyGpuBuffer(LResidualBuf);
+    LNorm.FreeNormWeights(LNormWeights);
+    LNorm.Cleanup();
+    LReader.Close();
+  finally
+    LNorm.Free();
+    LCompute.Free();
+    LReader.Free();
+  end;
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
 begin
   try
-    LIndex := 6;
+    LIndex := 7;
 
     case LIndex of
       1: Test01();
@@ -589,6 +739,7 @@ begin
       4: Test04();
       5: Test05();
       6: Test06();
+      7: Test07();
     end;
   except
     on E: Exception do
