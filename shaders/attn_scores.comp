@@ -1,0 +1,58 @@
+#version 450
+
+// Attention Scores: compute scaled dot product of one Q head against
+// all K cache entries for the corresponding KV head.
+//
+// score[pos] = (q[q_offset+d] · k[k_offset + pos*head_dim + d]) * scale
+//
+// Supports GQA by using offsets into shared Q and K cache buffers.
+//
+// Bindings:
+//   0 = q_buf (float[], all Q heads concatenated)
+//   1 = k_cache (float[], all KV heads × max_seq × head_dim)
+//   2 = scores (float[], seq_len elements, output)
+//
+// Push constants:
+//   head_dim  = dimension per head (256)
+//   seq_len   = number of positions in KV cache (including current)
+//   scale     = 1.0 / sqrt(head_dim)
+//   q_offset  = start index in q_buf for this Q head (in floats)
+//   k_offset  = start index in k_cache for this KV head (in floats)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  seq_len;
+    float scale;
+    uint  q_offset;
+    uint  k_offset;
+} pc;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+    float q_buf[];
+};
+
+layout(std430, binding = 1) readonly buffer KCacheBuf {
+    float k_cache[];
+};
+
+layout(std430, binding = 2) writeonly buffer ScoresBuf {
+    float scores[];
+};
+
+void main() {
+    uint pos = gl_GlobalInvocationID.x;
+
+    if (pos >= pc.seq_len)
+        return;
+
+    uint k_base = pc.k_offset + pos * pc.head_dim;
+    float acc = 0.0;
+
+    for (uint d = 0; d < pc.head_dim; d++) {
+        acc += q_buf[pc.q_offset + d] * k_cache[k_base + d];
+    }
+
+    scores[pos] = acc * pc.scale;
+}

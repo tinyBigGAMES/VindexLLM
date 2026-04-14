@@ -1,0 +1,59 @@
+#version 450
+
+// MatVec F16: multiply an F16 weight matrix by an F32 input vector.
+// One invocation per output row. Each thread computes the dot product
+// of one F16 row with the F32 input vector.
+//
+// Weight layout: row-major, packed F16 pairs (uint32).
+//   row r starts at: r * in_dim_half uint32s.
+//
+// Bindings:
+//   0 = weight matrix (uint[], packed F16 pairs, row-major)
+//   1 = input vector (float[], in_dim elements)
+//   2 = output vector (float[], out_dim elements)
+//
+// Push constants:
+//   in_dim_half = input dimension / 2 (e.g., 1280 for hidden_dim=2560)
+//   out_dim     = output dimension (e.g., 2048 for Q projection)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_dim_half;   // input dimension / 2
+    uint out_dim;       // output dimension (for bounds check)
+} pc;
+
+layout(std430, binding = 0) readonly buffer WeightBuf {
+    uint weight_data[];
+};
+
+layout(std430, binding = 1) readonly buffer InputBuf {
+    float input_vec[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputBuf {
+    float output_vec[];
+};
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+
+    // Bounds check — last workgroup may have excess invocations
+    if (row >= pc.out_dim)
+        return;
+
+    uint base = row * pc.in_dim_half;
+    float acc = 0.0;
+
+    // Process 2 input dimensions per iteration (one packed uint32 = two F16)
+    for (uint d = 0; d < pc.in_dim_half; d++) {
+        uint packed = weight_data[base + d];
+        vec2 unpacked = unpackHalf2x16(packed);
+
+        uint dim = d * 2;
+        acc += unpacked.x * input_vec[dim];
+        acc += unpacked.y * input_vec[dim + 1];
+    }
+
+    output_vec[row] = acc;
+}

@@ -1,0 +1,55 @@
+#version 450
+
+// Attention Value: weighted sum of V cache vectors, writing to a
+// specific offset in the output buffer.
+//
+// output[out_offset + d] = sum over pos: weights[pos] * v[v_offset + pos*head_dim + d]
+//
+// Supports GQA by using offsets into shared V cache and output buffers.
+//
+// Bindings:
+//   0 = weights (float[], seq_len elements, attention weights after softmax)
+//   1 = v_cache (float[], all KV heads × max_seq × head_dim)
+//   2 = output (float[], all Q heads concatenated)
+//
+// Push constants:
+//   head_dim   = dimension per head (256)
+//   seq_len    = number of positions in KV cache
+//   v_offset   = start index in v_cache for this KV head (in floats)
+//   out_offset = start index in output buffer for this Q head (in floats)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint seq_len;
+    uint v_offset;
+    uint out_offset;
+} pc;
+
+layout(std430, binding = 0) readonly buffer WeightsBuf {
+    float weights[];
+};
+
+layout(std430, binding = 1) readonly buffer VCacheBuf {
+    float v_cache[];
+};
+
+layout(std430, binding = 2) buffer OutputBuf {
+    float output_vec[];
+};
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+
+    if (d >= pc.head_dim)
+        return;
+
+    float acc = 0.0;
+
+    for (uint pos = 0; pos < pc.seq_len; pos++) {
+        acc += weights[pos] * v_cache[pc.v_offset + pos * pc.head_dim + d];
+    }
+
+    output_vec[pc.out_offset + d] = acc;
+}

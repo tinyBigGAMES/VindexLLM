@@ -783,6 +783,7 @@ type
 
     // Buffer-to-buffer copy (for staging uploads to device-local memory)
     procedure CopyBuffer(const ASrc: TVdxGpuBuffer; const ADst: TVdxGpuBuffer; const ASize: VkDeviceSize);
+    procedure CopyBufferRegion(const ASrc: TVdxGpuBuffer; const ASrcOffset: VkDeviceSize; const ADst: TVdxGpuBuffer; const ADstOffset: VkDeviceSize; const ASize: VkDeviceSize);
 
     // Cleanup helpers
     procedure DestroyDescriptorSetLayoutHandle(const ALayout: VkDescriptorSetLayout);
@@ -1456,6 +1457,37 @@ begin
   FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
 
   // End and submit with fence sync
+  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+
+  FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
+  LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  LSubmitInfo.commandBufferCount := 1;
+  LSubmitInfo.pCommandBuffers := @FCommandBuffer;
+
+  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
+  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
+  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+end;
+
+procedure TVdxVulkanCompute.CopyBufferRegion(const ASrc: TVdxGpuBuffer;
+  const ASrcOffset: VkDeviceSize; const ADst: TVdxGpuBuffer;
+  const ADstOffset: VkDeviceSize; const ASize: VkDeviceSize);
+var
+  LBeginInfo: VkCommandBufferBeginInfo;
+  LCopyRegion: VkBufferCopy;
+  LSubmitInfo: VkSubmitInfo;
+begin
+  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+
+  FillChar(LCopyRegion, SizeOf(LCopyRegion), 0);
+  LCopyRegion.srcOffset := ASrcOffset;
+  LCopyRegion.dstOffset := ADstOffset;
+  LCopyRegion.size := ASize;
+  FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
+
   CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
 
   FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);

@@ -1,0 +1,76 @@
+#version 450
+
+// QK-Norm: per-head RMSNorm on projected Q or K vectors.
+// One workgroup per head. Each workgroup normalizes head_dim elements.
+//
+// The same weight vector (head_dim elements) is applied to every head.
+// Vector layout: [head0: 0..head_dim-1] [head1: head_dim..2*head_dim-1] ...
+//
+// Bindings:
+//   0 = vector (float[], num_heads * head_dim elements, read/write in-place)
+//   1 = weight (float[], head_dim elements, read-only)
+//
+// Push constants:
+//   head_dim  = dimension per head (256 for Gemma 3 4B)
+//   num_heads = number of heads (8 for Q, 4 for K)
+//   eps       = epsilon for numerical stability (1e-6)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  num_heads;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) buffer VectorBuf {
+    float vec_data[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightBuf {
+    float weight[];
+};
+
+shared float partial_sums[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+
+    // Bounds check
+    if (head >= pc.num_heads)
+        return;
+
+    uint offset = head * pc.head_dim;
+
+    // Phase 1: sum of squares with stride loop
+    float sum_sq = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += 256) {
+        float val = vec_data[offset + i];
+        sum_sq += val * val;
+    }
+    partial_sums[tid] = sum_sq;
+
+    barrier();
+
+    // Parallel reduction
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial_sums[tid] += partial_sums[tid + stride];
+        }
+        barrier();
+    }
+
+    // Thread 0 computes inv_rms
+    if (tid == 0) {
+        partial_sums[0] = 1.0 / sqrt(partial_sums[0] / float(pc.head_dim) + pc.eps);
+    }
+
+    barrier();
+
+    // Phase 2: normalize in-place
+    float inv_rms = partial_sums[0];
+    for (uint i = tid; i < pc.head_dim; i += 256) {
+        vec_data[offset + i] = vec_data[offset + i] * inv_rms * weight[i];
+    }
+}

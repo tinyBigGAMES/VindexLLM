@@ -7,6 +7,7 @@
 uses
   System.SysUtils,
   UVdxTestbed in 'UVdxTestbed.pas',
+  VindexLLM.Attention in '..\src\VindexLLM.Attention.pas',
   VindexLLM.Config in '..\src\VindexLLM.Config.pas',
   VindexLLM.GGUFReader in '..\src\VindexLLM.GGUFReader.pas',
   VindexLLM.KNNWalk in '..\src\VindexLLM.KNNWalk.pas',

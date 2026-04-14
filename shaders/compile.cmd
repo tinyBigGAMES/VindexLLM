@@ -29,4 +29,40 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+%GLSLC% -V matvec_f16.comp -o matvec_f16.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: matvec_f16.comp
+    exit /b 1
+)
+
+%GLSLC% -V qk_norm.comp -o qk_norm.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: qk_norm.comp
+    exit /b 1
+)
+
+%GLSLC% -V rope.comp -o rope.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: rope.comp
+    exit /b 1
+)
+
+%GLSLC% -V attn_scores.comp -o attn_scores.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: attn_scores.comp
+    exit /b 1
+)
+
+%GLSLC% -V softmax.comp -o softmax.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: softmax.comp
+    exit /b 1
+)
+
+%GLSLC% -V attn_value.comp -o attn_value.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: attn_value.comp
+    exit /b 1
+)
+
 echo Done.

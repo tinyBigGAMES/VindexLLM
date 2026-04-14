@@ -1,0 +1,63 @@
+#version 450
+
+// RoPE: Rotary Position Embedding applied to Q or K vectors.
+// Gemma 3 uses the "rotary half" convention (GPT-NeoX/Llama style):
+//   pairs are (i, i + half_dim) for i in [0, half_dim-1].
+//
+// For dimension pair (i, i + half_dim) at position p:
+//   theta = p * (base ^ (-2*i / head_dim))
+//   new[i]          = x[i] * cos(theta) - x[i+half] * sin(theta)
+//   new[i + half]   = x[i] * sin(theta) + x[i+half] * cos(theta)
+//
+// One workgroup per head, threads process dimension pairs.
+//
+// Bindings:
+//   0 = vector (float[], num_heads * head_dim elements, read/write in-place)
+//
+// Push constants:
+//   head_dim   = dimension per head (256)
+//   num_heads  = number of heads
+//   position   = current sequence position (0-based)
+//   theta_base = base frequency (10000.0)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  num_heads;
+    uint  position;
+    float theta_base;
+} pc;
+
+layout(std430, binding = 0) buffer VectorBuf {
+    float vec_data[];
+};
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+
+    if (head >= pc.num_heads)
+        return;
+
+    uint half_dim = pc.head_dim / 2;
+
+    // Each thread handles one dimension pair with stride loop
+    for (uint i = tid; i < half_dim; i += 128) {
+        // Compute rotation angle for this dimension pair
+        float freq = pow(pc.theta_base, -float(2 * i) / float(pc.head_dim));
+        float theta = float(pc.position) * freq;
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+
+        uint offset = head * pc.head_dim;
+        uint idx_a = offset + i;
+        uint idx_b = offset + i + half_dim;
+
+        float a = vec_data[idx_a];
+        float b = vec_data[idx_b];
+
+        vec_data[idx_a] = a * cos_t - b * sin_t;
+        vec_data[idx_b] = a * sin_t + b * cos_t;
+    }
+}

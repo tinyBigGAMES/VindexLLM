@@ -14,7 +14,8 @@ uses
   VindexLLM.GGUFReader,
   VindexLLM.Vindex,
   VindexLLM.KNNWalk,
-  VindexLLM.LayerNorm;
+  VindexLLM.LayerNorm,
+  VindexLLM.Attention;
 
 // ============================================================================
 //  Embedded SPIR-V: "double every float" compute shader
@@ -725,12 +726,202 @@ begin
   end;
 end;
 
+// ============================================================================
+//  Test 08 — Attention MatVec F16: Q projection GPU vs CPU
+// ============================================================================
+
+procedure Test08();
+const
+  CGGUFPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
+  CHiddenDim = 2560;
+  CQOutDim = 2048;  // 8 Q heads * 256 head_dim
+  CNumQHeads = 8;
+  CNumKVHeads = 4;
+  CHeadDim = 256;
+  CNumLayers = 34;
+  CMaxSeqLen = 128;  // small for test
+var
+  LReader: TVdxGGUFReader;
+  LCompute: TVdxVulkanCompute;
+  LAttn: TVdxAttention;
+  LAttnWeights: TVdxAttnLayerWeights;
+  LInputBuf: TVdxGpuBuffer;
+  LOutputBuf: TVdxGpuBuffer;
+  LInputData: array of Single;
+  LOutputGpu: array of Single;
+  LOutputCpu: array of Single;
+  LWeightPtr: Pointer;
+  LRow: UInt32;
+  LCol: UInt32;
+  LAcc: Double;
+  LF16Val: Single;
+  LMaxErr: Double;
+  LErr: Double;
+  LPassed: Boolean;
+  LI: Integer;
+
+  // Convert a single F16 (UInt16) to F32
+  function F16ToF32(const AVal: UInt16): Single;
+  const
+    CSignBit: UInt32 = $80000000;
+  var
+    LExp: UInt32;
+    LMant: UInt32;
+    LBits: UInt32;
+  begin
+    LExp := (UInt32(AVal) shr 10) and $1F;
+    LMant := UInt32(AVal) and $3FF;
+
+    if LExp = 0 then
+    begin
+      if LMant = 0 then
+        // Positive or negative zero
+        LBits := 0
+      else
+      begin
+        // Denormalized: normalize by shifting mantissa left
+        LExp := 1;
+        while (LMant and $400) = 0 do
+        begin
+          LMant := LMant shl 1;
+          Inc(LExp);
+        end;
+        LMant := LMant and $3FF;
+        LBits := UInt32((113 - LExp) shl 23) or (LMant shl 13);
+      end;
+    end
+    else if LExp = $1F then
+      // Inf or NaN
+      LBits := UInt32($FF shl 23) or (LMant shl 13)
+    else
+      // Normalized
+      LBits := UInt32((LExp + 112) shl 23) or (LMant shl 13);
+
+    // Apply sign bit separately to avoid shl 31 overflow
+    if (AVal and $8000) <> 0 then
+      LBits := LBits or CSignBit;
+
+    Move(LBits, Result, 4);
+  end;
+
+begin
+  TVdxUtils.PrintLn(COLOR_CYAN + '=== Test 08: Attention MatVec F16 (Q Projection) GPU vs CPU ===');
+  TVdxUtils.PrintLn('');
+
+  LReader := TVdxGGUFReader.Create();
+  LCompute := TVdxVulkanCompute.Create();
+  LAttn := TVdxAttention.Create();
+  try
+    LReader.SetStatusCallback(StatusCallback);
+    LCompute.SetStatusCallback(StatusCallback);
+
+    TVdxUtils.FailIf(not LReader.Open(CGGUFPath),
+      'Failed to open GGUF: %s', [CGGUFPath]);
+
+    LCompute.Init();
+    LAttn.Init(LCompute, CHiddenDim, CNumQHeads, CNumKVHeads,
+      CHeadDim, CNumLayers, CMaxSeqLen);
+
+    TVdxUtils.PrintLn('Uploading layer 0 attention weights...');
+    LAttn.UploadAttnWeights(LReader, 0, LAttnWeights);
+
+    // Create test input: ramp [1, 2, ..., 2560] / 2560
+    SetLength(LInputData, CHiddenDim);
+    for LI := 0 to CHiddenDim - 1 do
+      LInputData[LI] := (LI + 1) / CHiddenDim;
+
+    LInputBuf := LCompute.CreateGpuBuffer(
+      UInt64(CHiddenDim) * SizeOf(Single),
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    LCompute.UploadToBuffer(LInputBuf, @LInputData[0],
+      UInt64(CHiddenDim) * SizeOf(Single));
+
+    LOutputBuf := LCompute.CreateGpuBuffer(
+      UInt64(CQOutDim) * SizeOf(Single),
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    TVdxUtils.PrintLn('Running GPU MatVec F16 (Q projection: %d x %d)...',
+      [CHiddenDim, CQOutDim]);
+    LAttn.TestMatVec(LAttnWeights.QWeightGpu, LInputBuf, LOutputBuf,
+      CHiddenDim, CQOutDim);
+
+    SetLength(LOutputGpu, CQOutDim);
+    LCompute.DownloadFromBuffer(LOutputBuf, @LOutputGpu[0],
+      UInt64(CQOutDim) * SizeOf(Single));
+
+    // CPU reference: F16 weight dot F32 input
+    TVdxUtils.PrintLn('Computing CPU reference...');
+    LWeightPtr := LReader.GetTensorDataPtr('blk.0.attn_q.weight');
+    SetLength(LOutputCpu, CQOutDim);
+
+    for LRow := 0 to CQOutDim - 1 do
+    begin
+      LAcc := 0.0;
+      for LCol := 0 to CHiddenDim - 1 do
+      begin
+        LF16Val := F16ToF32(PWord(PByte(LWeightPtr) + (UInt64(LRow) * CHiddenDim + UInt64(LCol)) * 2)^);
+        LAcc := LAcc + Double(LF16Val) * Double(LInputData[LCol]);
+      end;
+      LOutputCpu[LRow] := Single(LAcc);
+    end;
+
+    // Compare
+    LMaxErr := 0.0;
+    LPassed := True;
+    for LI := 0 to CQOutDim - 1 do
+    begin
+      LErr := Abs(Double(LOutputGpu[LI]) - Double(LOutputCpu[LI]));
+      if LErr > LMaxErr then
+        LMaxErr := LErr;
+      if LErr > 0.1 then
+      begin
+        TVdxUtils.PrintLn(COLOR_RED +
+          '  MISMATCH [%d]: GPU=%.6f CPU=%.6f err=%.6f',
+          [LI, LOutputGpu[LI], LOutputCpu[LI], LErr]);
+        LPassed := False;
+        if LI > 10 then
+        begin
+          TVdxUtils.PrintLn('  ... (showing first mismatches)');
+          Break;
+        end;
+      end;
+    end;
+
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_GREEN + '--- Results ---');
+    TVdxUtils.PrintLn('  Output dim:   %d', [CQOutDim]);
+    TVdxUtils.PrintLn('  Max error:    %.10f', [LMaxErr]);
+    TVdxUtils.PrintLn('  First 4 GPU:  [%.6f, %.6f, %.6f, %.6f]',
+      [LOutputGpu[0], LOutputGpu[1], LOutputGpu[2], LOutputGpu[3]]);
+    TVdxUtils.PrintLn('  First 4 CPU:  [%.6f, %.6f, %.6f, %.6f]',
+      [LOutputCpu[0], LOutputCpu[1], LOutputCpu[2], LOutputCpu[3]]);
+
+    if LPassed then
+      TVdxUtils.PrintLn(COLOR_GREEN +
+        'TEST 08 PASSED: MatVec F16 GPU matches CPU (max err=%.2e)', [LMaxErr])
+    else
+      TVdxUtils.PrintLn(COLOR_RED + 'TEST 08 FAILED: MatVec F16 GPU/CPU mismatch');
+
+    LCompute.DestroyGpuBuffer(LOutputBuf);
+    LCompute.DestroyGpuBuffer(LInputBuf);
+    LAttn.FreeAttnWeights(LAttnWeights);
+    LAttn.Cleanup();
+    LReader.Close();
+  finally
+    LAttn.Free();
+    LCompute.Free();
+    LReader.Free();
+  end;
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
 begin
   try
-    LIndex := 7;
+    LIndex := 8;
 
     case LIndex of
       1: Test01();
@@ -740,6 +931,7 @@ begin
       5: Test05();
       6: Test06();
       7: Test07();
+      8: Test08();
     end;
   except
     on E: Exception do
