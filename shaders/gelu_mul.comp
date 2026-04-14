@@ -1,0 +1,41 @@
+#version 450
+
+// GELU-Mul: compute hidden = GELU_tanh(gate) * up, in-place on gate buffer.
+// GELU with tanh approximation (matches PyTorch gelu_pytorch_tanh):
+//   GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//
+// Bindings:
+//   0 = gate (float[], read-write, overwritten with result)
+//   1 = up   (float[], read-only)
+//
+// Push constants:
+//   count = number of elements
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+} pc;
+
+layout(std430, binding = 0) buffer GateBuf {
+    float gate_data[];
+};
+
+layout(std430, binding = 1) readonly buffer UpBuf {
+    float up_data[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.count)
+        return;
+
+    float g = gate_data[idx];
+
+    // GELU with tanh approximation
+    // sqrt(2/pi) = 0.7978845608
+    float inner = 0.7978845608 * (g + 0.044715 * g * g * g);
+    float gelu_g = 0.5 * g * (1.0 + tanh(inner));
+
+    gate_data[idx] = gelu_g * up_data[idx];
+}

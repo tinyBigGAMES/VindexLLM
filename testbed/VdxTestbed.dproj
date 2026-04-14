@@ -116,6 +116,7 @@
         <DCCReference Include="..\src\VindexLLM.KNNWalk.pas"/>
         <DCCReference Include="..\src\VindexLLM.LayerNorm.pas"/>
         <DCCReference Include="..\src\VindexLLM.Resources.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
         <DCCReference Include="..\src\VindexLLM.TOML.pas"/>
         <DCCReference Include="..\src\VindexLLM.Utils.pas"/>
         <DCCReference Include="..\src\VindexLLM.Vindex.pas"/>

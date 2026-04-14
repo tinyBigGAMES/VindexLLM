@@ -155,12 +155,22 @@ type
       const AKNormBuf: TVdxGpuBuffer;
       const ALayerIndex: Integer;
       const APosition: Integer;
+      const AThetaBase: Single;
       const AOutputBuf: TVdxGpuBuffer);
 
     // Expose for testing: run a single matvec F16 dispatch
     procedure TestMatVec(const AWeightBuf: TVdxGpuBuffer;
       const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
       const AInDim: UInt32; const AOutDim: UInt32);
+
+    // Diagnostic read-only access to internal buffers (for debugging tests)
+    property ScoresBuf: TVdxGpuBuffer read FScoresBuf;
+    property QBuf: TVdxGpuBuffer read FQBuf;
+    property KBuf: TVdxGpuBuffer read FKBuf;
+    property VBuf: TVdxGpuBuffer read FVBuf;
+    property AttnOutBufInternal: TVdxGpuBuffer read FAttnOutBuf;
+    function GetKCache(const ALayerIndex: Integer): TVdxGpuBuffer;
+    function GetVCache(const ALayerIndex: Integer): TVdxGpuBuffer;
   end;
 
 implementation
@@ -296,7 +306,7 @@ begin
 
   FScoresBuf := FCompute.CreateGpuBuffer(
     UInt64(FMaxSeqLen) * SizeOf(Single),
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
   FAttnOutBuf := FCompute.CreateGpuBuffer(
@@ -313,12 +323,14 @@ begin
   begin
     FKCache[LI] := FCompute.CreateGpuBuffer(
       LCacheSize,
-      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT
+        or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     FVCache[LI] := FCompute.CreateGpuBuffer(
       LCacheSize,
-      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT
+        or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   end;
 end;
@@ -498,6 +510,20 @@ begin
     FCompute.DestroyGpuBuffer(AWeights.OWeightGpu);
 end;
 // ============================================================================
+//  TVdxAttention — Diagnostic accessors for KV cache
+// ============================================================================
+
+function TVdxAttention.GetKCache(const ALayerIndex: Integer): TVdxGpuBuffer;
+begin
+  Result := FKCache[ALayerIndex];
+end;
+
+function TVdxAttention.GetVCache(const ALayerIndex: Integer): TVdxGpuBuffer;
+begin
+  Result := FVCache[ALayerIndex];
+end;
+
+// ============================================================================
 //  TVdxAttention — Forward: Full attention for one layer at one position
 // ============================================================================
 
@@ -507,6 +533,7 @@ procedure TVdxAttention.Forward(const AInputBuf: TVdxGpuBuffer;
   const AKNormBuf: TVdxGpuBuffer;
   const ALayerIndex: Integer;
   const APosition: Integer;
+  const AThetaBase: Single;
   const AOutputBuf: TVdxGpuBuffer);
 var
   LSeqLen: UInt32;
@@ -567,7 +594,7 @@ begin
   // ---- Step 3: RoPE on Q and K ----
   LRoPEPush.HeadDim := FHeadDim;
   LRoPEPush.Position := UInt32(APosition);
-  LRoPEPush.ThetaBase := 10000.0;
+  LRoPEPush.ThetaBase := AThetaBase;
 
   // RoPE on Q (8 heads)
   LRoPEPush.NumHeads := FNumQHeads;

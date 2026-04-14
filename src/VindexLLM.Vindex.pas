@@ -31,6 +31,7 @@ type
   TVdxFFNLayerView = record
     LayerIndex: Integer;
     GatePtr: Pointer;         // Zero-copy pointer into mmap'd GGUF
+    UpPtr: Pointer;           // Zero-copy pointer into mmap'd GGUF (up projection)
     DownPtr: Pointer;         // Zero-copy pointer into mmap'd GGUF
     GateType: TVdxGGMLType;
     DownType: TVdxGGMLType;
@@ -110,6 +111,7 @@ var
   LLayerIdx: Integer;
   LMaxLayer: Integer;
   LGateName: string;
+  LUpName: string;
   LDownName: string;
   LGateInfo: TVdxGGUFTensorInfo;
   LDownInfo: TVdxGGUFTensorInfo;
@@ -151,9 +153,11 @@ begin
   for LI := 0 to FLayerCount - 1 do
   begin
     LGateName := Format('blk.%d.ffn_gate.weight', [LI]);
+    LUpName := Format('blk.%d.ffn_up.weight', [LI]);
     LDownName := Format('blk.%d.ffn_down.weight', [LI]);
 
     if (not AReader.HasTensor(LGateName)) or
+       (not AReader.HasTensor(LUpName)) or
        (not AReader.HasTensor(LDownName)) then
       Exit;
 
@@ -163,6 +167,7 @@ begin
     LLayer := Default(TVdxFFNLayerView);
     LLayer.LayerIndex := LI;
     LLayer.GatePtr := AReader.GetTensorDataPtr(LGateName);
+    LLayer.UpPtr := AReader.GetTensorDataPtr(LUpName);
     LLayer.DownPtr := AReader.GetTensorDataPtr(LDownName);
     LLayer.GateType := LGateInfo.TensorType;
     LLayer.DownType := LDownInfo.TensorType;

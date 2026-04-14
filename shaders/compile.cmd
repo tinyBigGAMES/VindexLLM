@@ -65,4 +65,10 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+%GLSLC% -V gelu_mul.comp -o gelu_mul.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: gelu_mul.comp
+    exit /b 1
+)
+
 echo Done.

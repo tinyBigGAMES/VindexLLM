@@ -42,6 +42,7 @@ type
     FTopK: Integer;
     FHiddenDim: UInt64;
     FFFNWidth: UInt64;
+    FUseUpProjection: Boolean;
 
     // GPU buffers (persistent)
     FResidualGpu: TVdxGpuBuffer;      // F32 x HiddenDim, host-visible coherent
@@ -97,6 +98,9 @@ type
     function GetTopK(): Integer;
     function GetHiddenDim(): UInt64;
     function GetFFNWidth(): UInt64;
+
+    // Debug toggle: enable/disable up projection in walk
+    property UseUpProjection: Boolean read FUseUpProjection write FUseUpProjection;
   end;
 
 implementation
@@ -116,6 +120,7 @@ begin
   FTopK := 0;
   FHiddenDim := 0;
   FFFNWidth := 0;
+  FUseUpProjection := True;
   FResidualMapped := nil;
   FScoresMapped := nil;
   FIndicesMapped := nil;
@@ -373,27 +378,34 @@ procedure TVdxKNNWalk.PackDownVectors(const ALayer: TVdxFFNLayerView;
   const AIndices: TArray<UInt32>; const ACount: Integer);
 var
   LI: Integer;
+  LD: Integer;
   LFeatureIdx: UInt64;
-  LSrcOffset: UInt64;
   LDstOffset: UInt64;
   LVectorBytes: UInt64;
+  LSrcF16: PWord;
+  LDstF16: PWord;
 begin
-  // Each down vector for feature k starts at k * HiddenDim * 2 bytes (F16)
-  // in the mmap'd GGUF. We pack K winners contiguously into FDownPack.
+  // Down tensor layout in GGUF: [ne0=FFNWidth, ne1=HiddenDim]
+  // Memory: HiddenDim groups of FFNWidth contiguous F16 elements.
+  // Element (feature j, output dim d) is at byte offset: (d * FFNWidth + j) * 2
+  //
+  // We need to GATHER feature j's 2560 output contributions from strided
+  // positions into a contiguous packed vector for the GPU shader.
   LVectorBytes := FHiddenDim * 2;  // F16 = 2 bytes per element
 
   for LI := 0 to ACount - 1 do
   begin
     LFeatureIdx := AIndices[LI];
-    LSrcOffset := LFeatureIdx * LVectorBytes;
     LDstOffset := UInt64(LI) * LVectorBytes;
+    LDstF16 := PWord(UIntPtr(FDownPack.Memory) + UIntPtr(LDstOffset));
 
-    // Copy from mmap'd GGUF down tensor into packed CPU buffer
-    Move(
-      Pointer(UIntPtr(ALayer.DownPtr) + UIntPtr(LSrcOffset))^,
-      Pointer(UIntPtr(FDownPack.Memory) + UIntPtr(LDstOffset))^,
-      LVectorBytes
-    );
+    // Gather: for each output dim d, read one F16 from strided position
+    for LD := 0 to Integer(FHiddenDim) - 1 do
+    begin
+      LSrcF16 := PWord(UIntPtr(ALayer.DownPtr) +
+        (UInt64(LD) * FFFNWidth + LFeatureIdx) * 2);
+      PWord(UIntPtr(LDstF16) + UInt64(LD) * 2)^ := LSrcF16^;
+    end;
   end;
 end;
 
@@ -412,6 +424,56 @@ var
   LTopValues: TArray<Single>;
   LStaging: TVdxGpuBuffer;
   LDownPackSize: UInt64;
+  LK: Integer;
+  LDim: Integer;
+  LFeatureIdx: UInt64;
+  LUpBase: PByte;
+  LPacked: UInt32;
+  LF16Lo: UInt16;
+  LF16Hi: UInt16;
+  LUpDot: Double;
+  LGateScore: Double;
+  LSilu: Double;
+  LValLo: Single;
+  LValHi: Single;
+  LHalfDim: Integer;
+
+  // Inline F16 to F32 conversion
+  function F16ToF32(const AVal: UInt16): Single;
+  const
+    CSignBit: UInt32 = $80000000;
+  var
+    LExp: UInt32;
+    LMant: UInt32;
+    LBits: UInt32;
+  begin
+    LExp := (UInt32(AVal) shr 10) and $1F;
+    LMant := UInt32(AVal) and $3FF;
+    if LExp = 0 then
+    begin
+      if LMant = 0 then
+        LBits := 0
+      else
+      begin
+        LExp := 1;
+        while (LMant and $400) = 0 do
+        begin
+          LMant := LMant shl 1;
+          Inc(LExp);
+        end;
+        LMant := LMant and $3FF;
+        LBits := UInt32((113 - LExp) shl 23) or (LMant shl 13);
+      end;
+    end
+    else if LExp = $1F then
+      LBits := UInt32($FF shl 23) or (LMant shl 13)
+    else
+      LBits := UInt32((LExp + 112) shl 23) or (LMant shl 13);
+    if (AVal and $8000) <> 0 then
+      LBits := LBits or CSignBit;
+    Move(LBits, Result, 4);
+  end;
+
 begin
   // Create descriptor pool for this layer (2 sets, 6 total storage buffers)
   LDescPool := FCompute.CreateDescriptorPoolForStorage(2, 6);
@@ -439,6 +501,39 @@ begin
     FScores.CopyFrom(FScoresMapped, FFFNWidth * SizeOf(Single));
 
     FindTopK(Integer(FFFNWidth), FTopK, LTopIndices, LTopValues);
+
+    // === Step 2b: Compute up dot products + SiLU gating (CPU) ===
+    // For each winner k: weight[k] = SiLU(gate_score[k]) * dot(up_row[k], input)
+    // This recovers the up projection modulation that makes FFN output correct.
+    if FUseUpProjection then
+    begin
+      LHalfDim := Integer(FHiddenDim div 2);
+
+      for LK := 0 to FTopK - 1 do
+      begin
+        LFeatureIdx := LTopIndices[LK];
+        LUpBase := PByte(ALayer.UpPtr) + LFeatureIdx * FHiddenDim * 2;
+
+        // Dot product: up_vector[feature] · residual (F16 × F32)
+        LUpDot := 0.0;
+        for LDim := 0 to LHalfDim - 1 do
+        begin
+          LPacked := PUInt32(LUpBase + UInt64(LDim) * 4)^;
+          LF16Lo := UInt16(LPacked and $FFFF);
+          LF16Hi := UInt16(LPacked shr 16);
+          LValLo := F16ToF32(LF16Lo);
+          LValHi := F16ToF32(LF16Hi);
+          LUpDot := LUpDot +
+            Double(LValLo) * Double(PSingle(PByte(FResidualMapped) + UInt64(LDim) * 8)^) +
+            Double(LValHi) * Double(PSingle(PByte(FResidualMapped) + UInt64(LDim) * 8 + 4)^);
+        end;
+
+        // SiLU(gate_score) * up_dot
+        LGateScore := Double(LTopValues[LK]);
+        LSilu := LGateScore / (1.0 + Exp(-LGateScore));
+        LTopValues[LK] := Single(LSilu * LUpDot);
+      end;
+    end;
 
     // === Step 3: Pack Down Vectors + Upload to GPU ===
     PackDownVectors(ALayer, LTopIndices, FTopK);
