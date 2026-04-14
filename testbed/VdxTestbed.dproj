@@ -111,8 +111,10 @@
         </DelphiCompile>
         <DCCReference Include="UVdxTestbed.pas"/>
         <DCCReference Include="..\src\VindexLLM.Attention.pas"/>
+        <DCCReference Include="..\src\VindexLLM.ChatTemplate.pas"/>
         <DCCReference Include="..\src\VindexLLM.Config.pas"/>
         <DCCReference Include="..\src\VindexLLM.GGUFReader.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Inference.pas"/>
         <DCCReference Include="..\src\VindexLLM.KNNWalk.pas"/>
         <DCCReference Include="..\src\VindexLLM.LayerNorm.pas"/>
         <DCCReference Include="..\src\VindexLLM.Resources.pas"/>
