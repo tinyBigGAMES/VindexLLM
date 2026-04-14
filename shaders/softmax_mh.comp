@@ -1,0 +1,85 @@
+#version 450
+
+// Multi-Head Softmax: normalize attention scores for ALL Q heads
+// in a single dispatch, eliminating 7 of 8 per-head softmax dispatches.
+//
+// Each workgroup independently processes one head's scores slice.
+// Same 3-phase algorithm as single-head softmax (max, exp+sum, normalize).
+//
+// Scores layout: [num_q_heads * max_seq] — head h at offset h * max_seq
+//
+// Dispatch: (num_q_heads, 1, 1) — one workgroup per head
+//
+// Bindings:
+//   0 = scores (float[], num_q_heads * max_seq, read/write in-place)
+//
+// Push constants:
+//   seq_len     = number of elements per head
+//   max_seq     = stride between heads in scores buffer
+//   num_q_heads = number of query heads
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint max_seq;
+    uint num_q_heads;
+} pc;
+
+layout(std430, binding = 0) buffer ScoresBuf {
+    float scores[];
+};
+
+shared float shared_data[256];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (head >= pc.num_q_heads)
+        return;
+
+    uint base = head * pc.max_seq;
+
+    // Phase 1: Find max (parallel reduction)
+    float local_max = -1.0e30;
+    for (uint i = tid; i < pc.seq_len; i += 256) {
+        local_max = max(local_max, scores[base + i]);
+    }
+    shared_data[tid] = local_max;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_data[tid] = max(shared_data[tid], shared_data[tid + stride]);
+        }
+        barrier();
+    }
+    float max_val = shared_data[0];
+    barrier();
+
+    // Phase 2: Compute exp(x - max) in-place and sum
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.seq_len; i += 256) {
+        float e = exp(scores[base + i] - max_val);
+        scores[base + i] = e;
+        local_sum += e;
+    }
+    shared_data[tid] = local_sum;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_data[tid] += shared_data[tid + stride];
+        }
+        barrier();
+    }
+    float total_sum = shared_data[0];
+    barrier();
+
+    // Phase 3: Normalize
+    float inv_sum = 1.0 / total_sum;
+    for (uint i = tid; i < pc.seq_len; i += 256) {
+        scores[base + i] = scores[base + i] * inv_sum;
+    }
+}

@@ -59,15 +59,40 @@ type
     VOffset: UInt32;
     OutOffset: UInt32;
   end;
+
+  // Multi-head push constants (all heads in one dispatch)
+  TVdxAttnScoresMHPush = record
+    HeadDim: UInt32;
+    SeqLen: UInt32;
+    MaxSeq: UInt32;
+    Scale: Single;
+    NumQHeads: UInt32;
+    GqaRatio: UInt32;
+  end;
+
+  TVdxSoftmaxMHPush = record
+    SeqLen: UInt32;
+    MaxSeq: UInt32;
+    NumQHeads: UInt32;
+  end;
+
+  TVdxAttnValueMHPush = record
+    HeadDim: UInt32;
+    SeqLen: UInt32;
+    MaxSeq: UInt32;
+    NumQHeads: UInt32;
+    GqaRatio: UInt32;
+  end;
 // ============================================================================
 //  Per-Layer Attention Weight GPU Buffers
 // ============================================================================
 
   TVdxAttnLayerWeights = record
-    QWeightGpu: TVdxGpuBuffer;   // F16 [2560 x 2048] = Q projection
-    KWeightGpu: TVdxGpuBuffer;   // F16 [2560 x 1024] = K projection
-    VWeightGpu: TVdxGpuBuffer;   // F16 [2560 x 1024] = V projection
-    OWeightGpu: TVdxGpuBuffer;   // F16 [2048 x 2560] = output projection
+    QWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2560 x 2048] = Q projection
+    KWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2560 x 1024] = K projection
+    VWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2560 x 1024] = V projection
+    OWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2048 x 2560] = output projection
+    WeightType: TVdxGGMLType;    // tensor format (gtF16 or gtQ4_0)
   end;
 
 // ============================================================================
@@ -81,18 +106,26 @@ type
 
     // Shader modules
     FMatVecShader: VkShaderModule;
+    FMatVecQ8Shader: VkShaderModule;
     FQKNormShader: VkShaderModule;
     FRoPEShader: VkShaderModule;
     FAttnScoresShader: VkShaderModule;
     FSoftmaxShader: VkShaderModule;
     FAttnValueShader: VkShaderModule;
+    FAttnScoresMHShader: VkShaderModule;
+    FSoftmaxMHShader: VkShaderModule;
+    FAttnValueMHShader: VkShaderModule;
     // Pipeline bundles
     FMatVecBundle: TVdxComputePipelineBundle;
+    FMatVecQ8Bundle: TVdxComputePipelineBundle;
     FQKNormBundle: TVdxComputePipelineBundle;
     FRoPEBundle: TVdxComputePipelineBundle;
     FAttnScoresBundle: TVdxComputePipelineBundle;
     FSoftmaxBundle: TVdxComputePipelineBundle;
     FAttnValueBundle: TVdxComputePipelineBundle;
+    FAttnScoresMHBundle: TVdxComputePipelineBundle;
+    FSoftmaxMHBundle: TVdxComputePipelineBundle;
+    FAttnValueMHBundle: TVdxComputePipelineBundle;
 
     // Descriptor set layouts
     FMatVecDescLayout: VkDescriptorSetLayout;      // 3 bindings
@@ -101,6 +134,15 @@ type
     FAttnScoresDescLayout: VkDescriptorSetLayout;  // 3 bindings
     FSoftmaxDescLayout: VkDescriptorSetLayout;     // 1 binding
     FAttnValueDescLayout: VkDescriptorSetLayout;   // 3 bindings
+
+    // Pre-allocated descriptor pool + reusable sets (eliminates per-dispatch churn)
+    FDescPool: VkDescriptorPool;
+    FMatVecDescSet: VkDescriptorSet;
+    FQKNormDescSet: VkDescriptorSet;
+    FRoPEDescSet: VkDescriptorSet;
+    FScoresDescSet: VkDescriptorSet;
+    FSoftmaxDescSet: VkDescriptorSet;
+    FValueDescSet: VkDescriptorSet;
 
     // Scratch buffers (reused every Forward call)
     FQBuf: TVdxGpuBuffer;        // [NumQHeads * HeadDim] F32
@@ -124,7 +166,8 @@ type
     function LoadShader(const AFileName: string): VkShaderModule;
     procedure DispatchMatVec(const AWeightBuf: TVdxGpuBuffer;
       const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
-      const AInDim: UInt32; const AOutDim: UInt32);
+      const AInDim: UInt32; const AOutDim: UInt32;
+      const ATensorType: TVdxGGMLType);
 
   public
     constructor Create(); override;
@@ -161,7 +204,8 @@ type
     // Expose for testing: run a single matvec F16 dispatch
     procedure TestMatVec(const AWeightBuf: TVdxGpuBuffer;
       const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
-      const AInDim: UInt32; const AOutDim: UInt32);
+      const AInDim: UInt32; const AOutDim: UInt32;
+      const ATensorType: TVdxGGMLType = gtF16);
 
     // Diagnostic read-only access to internal buffers (for debugging tests)
     property ScoresBuf: TVdxGpuBuffer read FScoresBuf;
@@ -187,18 +231,26 @@ begin
 
   FCompute := nil;
   FMatVecShader := VK_NULL_HANDLE;
+  FMatVecQ8Shader := VK_NULL_HANDLE;
   FQKNormShader := VK_NULL_HANDLE;
   FRoPEShader := VK_NULL_HANDLE;
   FAttnScoresShader := VK_NULL_HANDLE;
   FSoftmaxShader := VK_NULL_HANDLE;
   FAttnValueShader := VK_NULL_HANDLE;
+  FAttnScoresMHShader := VK_NULL_HANDLE;
+  FSoftmaxMHShader := VK_NULL_HANDLE;
+  FAttnValueMHShader := VK_NULL_HANDLE;
 
   FMatVecBundle.Pipeline := VK_NULL_HANDLE;
+  FMatVecQ8Bundle.Pipeline := VK_NULL_HANDLE;
   FQKNormBundle.Pipeline := VK_NULL_HANDLE;
   FRoPEBundle.Pipeline := VK_NULL_HANDLE;
   FAttnScoresBundle.Pipeline := VK_NULL_HANDLE;
   FSoftmaxBundle.Pipeline := VK_NULL_HANDLE;
   FAttnValueBundle.Pipeline := VK_NULL_HANDLE;
+  FAttnScoresMHBundle.Pipeline := VK_NULL_HANDLE;
+  FSoftmaxMHBundle.Pipeline := VK_NULL_HANDLE;
+  FAttnValueMHBundle.Pipeline := VK_NULL_HANDLE;
 
   FMatVecDescLayout := VK_NULL_HANDLE;
   FQKNormDescLayout := VK_NULL_HANDLE;
@@ -206,6 +258,8 @@ begin
   FAttnScoresDescLayout := VK_NULL_HANDLE;
   FSoftmaxDescLayout := VK_NULL_HANDLE;
   FAttnValueDescLayout := VK_NULL_HANDLE;
+
+  FDescPool := VK_NULL_HANDLE;
 end;
 destructor TVdxAttention.Destroy();
 begin
@@ -255,13 +309,17 @@ begin
   FNumLayers := ANumLayers;
   FMaxSeqLen := AMaxSeqLen;
 
-  // Load all 6 shaders
+  // Load all shaders
   FMatVecShader := LoadShader('matvec_f16.spv');
+  FMatVecQ8Shader := LoadShader('matvec_q8_0.spv');
   FQKNormShader := LoadShader('qk_norm.spv');
   FRoPEShader := LoadShader('rope.spv');
   FAttnScoresShader := LoadShader('attn_scores.spv');
   FSoftmaxShader := LoadShader('softmax.spv');
   FAttnValueShader := LoadShader('attn_value.spv');
+  FAttnScoresMHShader := LoadShader('attn_scores_mh.spv');
+  FSoftmaxMHShader := LoadShader('softmax_mh.spv');
+  FAttnValueMHShader := LoadShader('attn_value_mh.spv');
   // Create descriptor set layouts
   FMatVecDescLayout := FCompute.CreateStorageDescriptorSetLayout(3);
   FQKNormDescLayout := FCompute.CreateStorageDescriptorSetLayout(2);
@@ -273,6 +331,8 @@ begin
   // Create pipelines with push constants
   FMatVecBundle := FCompute.CreateComputePipelineWithPush(
     FMatVecShader, 'main', FMatVecDescLayout, SizeOf(TVdxMatVecF16Push));
+  FMatVecQ8Bundle := FCompute.CreateComputePipelineWithPush(
+    FMatVecQ8Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatVecF16Push));
   FQKNormBundle := FCompute.CreateComputePipelineWithPush(
     FQKNormShader, 'main', FQKNormDescLayout, SizeOf(TVdxQKNormPush));
   FRoPEBundle := FCompute.CreateComputePipelineWithPush(
@@ -285,6 +345,34 @@ begin
   FAttnValueBundle := FCompute.CreateComputePipelineWithPush(
     FAttnValueShader, 'main', FAttnValueDescLayout,
     SizeOf(TVdxAttnValuePush));
+
+  // Multi-head pipelines (reuse existing descriptor set layouts)
+  FAttnScoresMHBundle := FCompute.CreateComputePipelineWithPush(
+    FAttnScoresMHShader, 'main', FAttnScoresDescLayout,
+    SizeOf(TVdxAttnScoresMHPush));
+  FSoftmaxMHBundle := FCompute.CreateComputePipelineWithPush(
+    FSoftmaxMHShader, 'main', FSoftmaxDescLayout,
+    SizeOf(TVdxSoftmaxMHPush));
+  FAttnValueMHBundle := FCompute.CreateComputePipelineWithPush(
+    FAttnValueMHShader, 'main', FAttnValueDescLayout,
+    SizeOf(TVdxAttnValueMHPush));
+
+  // Pre-allocate one descriptor pool + 6 reusable sets (no per-dispatch churn)
+  // Total descriptors: 3+2+1+3+1+3 = 13 storage buffers across 6 sets
+  FDescPool := FCompute.CreateDescriptorPoolForStorage(6, 13);
+  FMatVecDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPool, FMatVecDescLayout, [FQBuf, FQBuf, FQBuf]);
+  FQKNormDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPool, FQKNormDescLayout, [FQBuf, FQBuf]);
+  FRoPEDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPool, FRoPEDescLayout, [FQBuf]);
+  FScoresDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPool, FAttnScoresDescLayout, [FQBuf, FQBuf, FQBuf]);
+  FSoftmaxDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPool, FSoftmaxDescLayout, [FQBuf]);
+  FValueDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPool, FAttnValueDescLayout, [FQBuf, FQBuf, FQBuf]);
+
   // Allocate scratch buffers (device-local, storage + transfer)
   FQBuf := FCompute.CreateGpuBuffer(
     UInt64(FNumQHeads) * FHeadDim * SizeOf(Single),
@@ -305,7 +393,7 @@ begin
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
   FScoresBuf := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * SizeOf(Single),
+    UInt64(FNumQHeads) * FMaxSeqLen * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
@@ -369,11 +457,19 @@ begin
     FCompute.DestroyGpuBuffer(FAttnOutBuf);
   // Destroy pipelines
   FCompute.DestroyComputePipelineBundle(FMatVecBundle);
+  FCompute.DestroyComputePipelineBundle(FMatVecQ8Bundle);
   FCompute.DestroyComputePipelineBundle(FQKNormBundle);
   FCompute.DestroyComputePipelineBundle(FRoPEBundle);
   FCompute.DestroyComputePipelineBundle(FAttnScoresBundle);
   FCompute.DestroyComputePipelineBundle(FSoftmaxBundle);
   FCompute.DestroyComputePipelineBundle(FAttnValueBundle);
+  FCompute.DestroyComputePipelineBundle(FAttnScoresMHBundle);
+  FCompute.DestroyComputePipelineBundle(FSoftmaxMHBundle);
+  FCompute.DestroyComputePipelineBundle(FAttnValueMHBundle);
+
+  // Destroy pre-allocated descriptor pool (frees all 6 sets automatically)
+  if FDescPool <> VK_NULL_HANDLE then
+    FCompute.DestroyDescriptorPoolHandle(FDescPool);
 
   // Destroy descriptor set layouts
   FCompute.DestroyDescriptorSetLayoutHandle(FMatVecDescLayout);
@@ -385,11 +481,15 @@ begin
 
   // Destroy shader modules
   FCompute.DestroyShaderModuleHandle(FMatVecShader);
+  FCompute.DestroyShaderModuleHandle(FMatVecQ8Shader);
   FCompute.DestroyShaderModuleHandle(FQKNormShader);
   FCompute.DestroyShaderModuleHandle(FRoPEShader);
   FCompute.DestroyShaderModuleHandle(FAttnScoresShader);
   FCompute.DestroyShaderModuleHandle(FSoftmaxShader);
   FCompute.DestroyShaderModuleHandle(FAttnValueShader);
+  FCompute.DestroyShaderModuleHandle(FAttnScoresMHShader);
+  FCompute.DestroyShaderModuleHandle(FSoftmaxMHShader);
+  FCompute.DestroyShaderModuleHandle(FAttnValueMHShader);
 
   FCompute := nil;
 end;
@@ -399,35 +499,44 @@ end;
 
 procedure TVdxAttention.DispatchMatVec(const AWeightBuf: TVdxGpuBuffer;
   const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
-  const AInDim: UInt32; const AOutDim: UInt32);
+  const AInDim: UInt32; const AOutDim: UInt32;
+  const ATensorType: TVdxGGMLType);
 var
   LPush: TVdxMatVecF16Push;
-  LDescPool: VkDescriptorPool;
-  LDescSet: VkDescriptorSet;
   LGroups: UInt32;
+  LPipeline: VkPipeline;
+  LPipelineLayout: VkPipelineLayout;
 begin
-  LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 3);
-  try
-    LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-      LDescPool, FMatVecDescLayout,
-      [AWeightBuf, AInputBuf, AOutputBuf]);
+  // Rebind buffers to pre-allocated descriptor set (no pool create/destroy)
+  FCompute.UpdateDescriptorSetBuffers(FMatVecDescSet,
+    [AWeightBuf, AInputBuf, AOutputBuf]);
 
+  // Select pipeline: Q8_0 uses full in_dim, F16 uses in_dim/2
+  if ATensorType = gtQ8_0 then
+  begin
+    LPush.InDimHalf := AInDim;
+    LPipeline := FMatVecQ8Bundle.Pipeline;
+    LPipelineLayout := FMatVecQ8Bundle.PipelineLayout;
+  end
+  else
+  begin
     LPush.InDimHalf := AInDim div 2;
-    LPush.OutDim := AOutDim;
-
-    // One invocation per output row, 256 threads per workgroup
-    LGroups := (AOutDim + 255) div 256;
-
-    FCompute.DispatchComputeWithPush(
-      FMatVecBundle.Pipeline,
-      FMatVecBundle.PipelineLayout,
-      LDescSet,
-      @LPush,
-      SizeOf(LPush),
-      LGroups);
-  finally
-    FCompute.DestroyDescriptorPoolHandle(LDescPool);
+    LPipeline := FMatVecBundle.Pipeline;
+    LPipelineLayout := FMatVecBundle.PipelineLayout;
   end;
+
+  LPush.OutDim := AOutDim;
+
+  // Tiled: one workgroup (256 threads) per output row
+  LGroups := AOutDim;
+
+  FCompute.DispatchComputeWithPush(
+    LPipeline,
+    LPipelineLayout,
+    FMatVecDescSet,
+    @LPush,
+    SizeOf(LPush),
+    LGroups);
 end;
 // ============================================================================
 //  TVdxAttention — TestMatVec: Public wrapper for testing
@@ -435,9 +544,10 @@ end;
 
 procedure TVdxAttention.TestMatVec(const AWeightBuf: TVdxGpuBuffer;
   const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
-  const AInDim: UInt32; const AOutDim: UInt32);
+  const AInDim: UInt32; const AOutDim: UInt32;
+  const ATensorType: TVdxGGMLType);
 begin
-  DispatchMatVec(AWeightBuf, AInputBuf, AOutputBuf, AInDim, AOutDim);
+  DispatchMatVec(AWeightBuf, AInputBuf, AOutputBuf, AInDim, AOutDim, ATensorType);
 end;
 // ============================================================================
 //  TVdxAttention — Upload Attention Weights from GGUF
@@ -446,7 +556,7 @@ end;
 procedure TVdxAttention.UploadAttnWeights(const AReader: TVdxGGUFReader;
   const ALayerIndex: Integer; out AWeights: TVdxAttnLayerWeights);
 
-  // Upload one F16 tensor from GGUF to device-local GPU buffer
+  // Upload one weight tensor (F16 or Q4_0) from GGUF to device-local GPU
   function UploadOneTensor(const ATensorName: string): TVdxGpuBuffer;
   var
     LInfo: TVdxGGUFTensorInfo;
@@ -460,9 +570,12 @@ procedure TVdxAttention.UploadAttnWeights(const AReader: TVdxGGUFReader;
     LInfo := AReader.GetTensorInfo(ATensorName);
     LPtr := AReader.GetTensorDataPtr(ATensorName);
 
-    // Compute byte size: dims[0] * dims[1] * bytes_per_element
-    // F16 = 2 bytes per element
-    LSize := UInt64(LInfo.Dimensions[0]) * UInt64(LInfo.Dimensions[1]) * 2;
+    // Compute byte size — works for F16, Q4_0, and other types
+    LSize := VdxGGMLTensorBytes(LInfo.TensorType,
+      LInfo.Dimensions[0], LInfo.Dimensions[1]);
+    TVdxUtils.FailIf(LSize = 0,
+      'Attention: unsupported tensor type for %s: %s',
+      [ATensorName, VdxGGMLTypeName(LInfo.TensorType)]);
 
     LStaging := FCompute.CreateGpuBuffer(
       LSize,
@@ -481,8 +594,16 @@ procedure TVdxAttention.UploadAttnWeights(const AReader: TVdxGGUFReader;
       FCompute.DestroyGpuBuffer(LStaging);
     end;
   end;
+
+var
+  LQInfo: TVdxGGUFTensorInfo;
 begin
   AWeights := Default(TVdxAttnLayerWeights);
+
+  // Detect weight type from Q tensor (all attn weights share the same type)
+  LQInfo := AReader.GetTensorInfo(
+    Format('blk.%d.attn_q.weight', [ALayerIndex]));
+  AWeights.WeightType := LQInfo.TensorType;
 
   AWeights.QWeightGpu := UploadOneTensor(
     Format('blk.%d.attn_q.weight', [ALayerIndex]));
@@ -537,30 +658,25 @@ procedure TVdxAttention.Forward(const AInputBuf: TVdxGpuBuffer;
   const AOutputBuf: TVdxGpuBuffer);
 var
   LSeqLen: UInt32;
-  LQHead: UInt32;
   LKVHead: UInt32;
-  LQOffset: UInt32;
-  LKVCacheOffset: UInt32;
   LHeadBytes: UInt64;
   LKVHeadBytes: UInt64;
-  LDescPool: VkDescriptorPool;
-  LDescSet: VkDescriptorSet;
   LQKNormPush: TVdxQKNormPush;
   LRoPEPush: TVdxRoPEPush;
-  LScoresPush: TVdxAttnScoresPush;
-  LSoftmaxPush: TVdxSoftmaxPush;
-  LValuePush: TVdxAttnValuePush;
+  LScoresMHPush: TVdxAttnScoresMHPush;
+  LSoftmaxMHPush: TVdxSoftmaxMHPush;
+  LValueMHPush: TVdxAttnValueMHPush;
 begin
   LSeqLen := UInt32(APosition) + 1;
   LHeadBytes := UInt64(FHeadDim) * SizeOf(Single);
   LKVHeadBytes := UInt64(FMaxSeqLen) * FHeadDim * SizeOf(Single);
-  // ---- Step 1: Q/K/V projections (F16 matvec) ----
+  // ---- Step 1: Q/K/V projections (matvec — F16 or Q4_0) ----
   DispatchMatVec(AWeights.QWeightGpu, AInputBuf, FQBuf,
-    FHiddenDim, FNumQHeads * FHeadDim);
+    FHiddenDim, FNumQHeads * FHeadDim, AWeights.WeightType);
   DispatchMatVec(AWeights.KWeightGpu, AInputBuf, FKBuf,
-    FHiddenDim, FNumKVHeads * FHeadDim);
+    FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
   DispatchMatVec(AWeights.VWeightGpu, AInputBuf, FVBuf,
-    FHiddenDim, FNumKVHeads * FHeadDim);
+    FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
 
   // ---- Step 2: QK-norm on Q (8 heads) and K (4 heads) ----
   LQKNormPush.HeadDim := FHeadDim;
@@ -568,29 +684,17 @@ begin
 
   // QK-norm on Q
   LQKNormPush.NumHeads := FNumQHeads;
-  LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
-  try
-    LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-      LDescPool, FQKNormDescLayout, [FQBuf, AQNormBuf]);
-    FCompute.DispatchComputeWithPush(
-      FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
-      LDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumQHeads);
-  finally
-    FCompute.DestroyDescriptorPoolHandle(LDescPool);
-  end;
+  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [FQBuf, AQNormBuf]);
+  FCompute.DispatchComputeWithPush(
+    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumQHeads);
 
   // QK-norm on K
   LQKNormPush.NumHeads := FNumKVHeads;
-  LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
-  try
-    LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-      LDescPool, FQKNormDescLayout, [FKBuf, AKNormBuf]);
-    FCompute.DispatchComputeWithPush(
-      FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
-      LDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumKVHeads);
-  finally
-    FCompute.DestroyDescriptorPoolHandle(LDescPool);
-  end;
+  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [FKBuf, AKNormBuf]);
+  FCompute.DispatchComputeWithPush(
+    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumKVHeads);
   // ---- Step 3: RoPE on Q and K ----
   LRoPEPush.HeadDim := FHeadDim;
   LRoPEPush.Position := UInt32(APosition);
@@ -598,29 +702,17 @@ begin
 
   // RoPE on Q (8 heads)
   LRoPEPush.NumHeads := FNumQHeads;
-  LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 1);
-  try
-    LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-      LDescPool, FRoPEDescLayout, [FQBuf]);
-    FCompute.DispatchComputeWithPush(
-      FRoPEBundle.Pipeline, FRoPEBundle.PipelineLayout,
-      LDescSet, @LRoPEPush, SizeOf(LRoPEPush), FNumQHeads);
-  finally
-    FCompute.DestroyDescriptorPoolHandle(LDescPool);
-  end;
+  FCompute.UpdateDescriptorSetBuffers(FRoPEDescSet, [FQBuf]);
+  FCompute.DispatchComputeWithPush(
+    FRoPEBundle.Pipeline, FRoPEBundle.PipelineLayout,
+    FRoPEDescSet, @LRoPEPush, SizeOf(LRoPEPush), FNumQHeads);
 
   // RoPE on K (4 heads)
   LRoPEPush.NumHeads := FNumKVHeads;
-  LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 1);
-  try
-    LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-      LDescPool, FRoPEDescLayout, [FKBuf]);
-    FCompute.DispatchComputeWithPush(
-      FRoPEBundle.Pipeline, FRoPEBundle.PipelineLayout,
-      LDescSet, @LRoPEPush, SizeOf(LRoPEPush), FNumKVHeads);
-  finally
-    FCompute.DestroyDescriptorPoolHandle(LDescPool);
-  end;
+  FCompute.UpdateDescriptorSetBuffers(FRoPEDescSet, [FKBuf]);
+  FCompute.DispatchComputeWithPush(
+    FRoPEBundle.Pipeline, FRoPEBundle.PipelineLayout,
+    FRoPEDescSet, @LRoPEPush, SizeOf(LRoPEPush), FNumKVHeads);
   // ---- Step 4: Store K and V in KV cache at current position ----
   // Cache layout: [NumKVHeads × MaxSeqLen × HeadDim]
   // For each KV head h, copy HeadDim floats from K/VBuf to cache
@@ -642,72 +734,51 @@ begin
       (UInt64(LKVHead) * FMaxSeqLen + UInt64(APosition)) * FHeadDim * SizeOf(Single),
       LHeadBytes);
   end;
-  // ---- Step 5: Per-head attention (scores → softmax → value) ----
-  // GQA: each KV head serves NumQHeads/NumKVHeads Q heads
-  for LQHead := 0 to FNumQHeads - 1 do
-  begin
-    LKVHead := LQHead div (FNumQHeads div FNumKVHeads);
-    LQOffset := LQHead * FHeadDim;
-    // KV cache offset for this KV head: h * MaxSeqLen * HeadDim (in floats)
-    LKVCacheOffset := LKVHead * FMaxSeqLen * FHeadDim;
+  // ---- Step 5: Multi-head attention (all heads in 3 dispatches) ----
 
-    // 5a. Attention scores: q_head dot all K cache entries
-    LScoresPush.HeadDim := FHeadDim;
-    LScoresPush.SeqLen := LSeqLen;
-    LScoresPush.Scale := 1.0 / Sqrt(Single(FHeadDim));
-    LScoresPush.QOffset := LQOffset;
-    LScoresPush.KOffset := LKVCacheOffset;
+  // 5a. All heads' scores in one 2D dispatch
+  LScoresMHPush.HeadDim := FHeadDim;
+  LScoresMHPush.SeqLen := LSeqLen;
+  LScoresMHPush.MaxSeq := FMaxSeqLen;
+  LScoresMHPush.Scale := 1.0 / Sqrt(Single(FHeadDim));
+  LScoresMHPush.NumQHeads := FNumQHeads;
+  LScoresMHPush.GqaRatio := FNumQHeads div FNumKVHeads;
 
-    LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 3);
-    try
-      LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-        LDescPool, FAttnScoresDescLayout,
-        [FQBuf, FKCache[ALayerIndex], FScoresBuf]);
-      FCompute.DispatchComputeWithPush(
-        FAttnScoresBundle.Pipeline, FAttnScoresBundle.PipelineLayout,
-        LDescSet, @LScoresPush, SizeOf(LScoresPush),
-        (LSeqLen + 255) div 256);
-    finally
-      FCompute.DestroyDescriptorPoolHandle(LDescPool);
-    end;
-    // 5b. Softmax on scores
-    LSoftmaxPush.SeqLen := LSeqLen;
+  FCompute.UpdateDescriptorSetBuffers(FScoresDescSet,
+    [FQBuf, FKCache[ALayerIndex], FScoresBuf]);
+  FCompute.DispatchComputeWithPush(
+    FAttnScoresMHBundle.Pipeline, FAttnScoresMHBundle.PipelineLayout,
+    FScoresDescSet, @LScoresMHPush, SizeOf(LScoresMHPush),
+    (LSeqLen + 255) div 256, FNumQHeads);
 
-    LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 1);
-    try
-      LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-        LDescPool, FSoftmaxDescLayout, [FScoresBuf]);
-      FCompute.DispatchComputeWithPush(
-        FSoftmaxBundle.Pipeline, FSoftmaxBundle.PipelineLayout,
-        LDescSet, @LSoftmaxPush, SizeOf(LSoftmaxPush),
-        1);  // single workgroup
-    finally
-      FCompute.DestroyDescriptorPoolHandle(LDescPool);
-    end;
+  // 5b. All heads' softmax in one dispatch (one workgroup per head)
+  LSoftmaxMHPush.SeqLen := LSeqLen;
+  LSoftmaxMHPush.MaxSeq := FMaxSeqLen;
+  LSoftmaxMHPush.NumQHeads := FNumQHeads;
 
-    // 5c. Weighted V sum → write to AttnOutBuf at this head's offset
-    LValuePush.HeadDim := FHeadDim;
-    LValuePush.SeqLen := LSeqLen;
-    LValuePush.VOffset := LKVCacheOffset;
-    LValuePush.OutOffset := LQOffset;
+  FCompute.UpdateDescriptorSetBuffers(FSoftmaxDescSet, [FScoresBuf]);
+  FCompute.DispatchComputeWithPush(
+    FSoftmaxMHBundle.Pipeline, FSoftmaxMHBundle.PipelineLayout,
+    FSoftmaxDescSet, @LSoftmaxMHPush, SizeOf(LSoftmaxMHPush),
+    FNumQHeads);
 
-    LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 3);
-    try
-      LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-        LDescPool, FAttnValueDescLayout,
-        [FScoresBuf, FVCache[ALayerIndex], FAttnOutBuf]);
-      FCompute.DispatchComputeWithPush(
-        FAttnValueBundle.Pipeline, FAttnValueBundle.PipelineLayout,
-        LDescSet, @LValuePush, SizeOf(LValuePush),
-        (FHeadDim + 255) div 256);
-    finally
-      FCompute.DestroyDescriptorPoolHandle(LDescPool);
-    end;
-  end;
+  // 5c. All heads' weighted V sum in one 2D dispatch
+  LValueMHPush.HeadDim := FHeadDim;
+  LValueMHPush.SeqLen := LSeqLen;
+  LValueMHPush.MaxSeq := FMaxSeqLen;
+  LValueMHPush.NumQHeads := FNumQHeads;
+  LValueMHPush.GqaRatio := FNumQHeads div FNumKVHeads;
+
+  FCompute.UpdateDescriptorSetBuffers(FValueDescSet,
+    [FScoresBuf, FVCache[ALayerIndex], FAttnOutBuf]);
+  FCompute.DispatchComputeWithPush(
+    FAttnValueMHBundle.Pipeline, FAttnValueMHBundle.PipelineLayout,
+    FValueDescSet, @LValueMHPush, SizeOf(LValueMHPush),
+    (FHeadDim + 255) div 256, FNumQHeads);
   // ---- Step 6: Output projection ----
-  // O: W[2048 × 2560] F16 × attn_out[2048] F32 → output[2560] F32
+  // O: W[NumQHeads*HeadDim × HiddenDim] × attn_out → output
   DispatchMatVec(AWeights.OWeightGpu, FAttnOutBuf, AOutputBuf,
-    FNumQHeads * FHeadDim, FHiddenDim);
+    FNumQHeads * FHeadDim, FHiddenDim, AWeights.WeightType);
 end;
 
 end.

@@ -1,0 +1,61 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// GPU Embedding Lookup (Q8_0): read one row from Q8_0 embedding table,
+// dequantize to F32 with scaling, write to residual buffer.
+// Eliminates CPU Q8_0→F32 conversion + PCIe upload per token.
+//
+// Uses shared-memory scale cache (same technique as matvec_q8_0).
+//
+// Dispatch: (1, 1, 1) — single workgroup, 256 threads handle 2560 elements
+//
+// Bindings:
+//   0 = embedding table (int8_t[], raw Q8_0 blocks, row-major)
+//   1 = output residual (float[], hidden_dim elements)
+//
+// Push constants:
+//   token_id       = vocabulary index to look up
+//   dim_param      = hidden_dim (number of elements per row)
+//   embed_scale    = sqrt(hidden_dim) scaling factor
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  token_id;
+    uint  dim_param;
+    float embed_scale;
+} pc;
+
+layout(std430, binding = 0) readonly buffer EmbedBuf {
+    int8_t embed_bytes[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuf {
+    float output_vec[];
+};
+
+shared float blk_scales[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    uint blocks_per_row = pc.dim_param >> 5;  // hidden_dim / 32
+    uint row_byte_off = pc.token_id * blocks_per_row * 34;
+
+    // Cooperatively load all block scales into shared memory
+    for (uint b = tid; b < blocks_per_row; b += 256) {
+        uint off = row_byte_off + b * 34;
+        uint lo = uint(embed_bytes[off]) & 0xFF;
+        uint hi = uint(embed_bytes[off + 1]) & 0xFF;
+        blk_scales[b] = unpackHalf2x16(lo | (hi << 8)).x;
+    }
+    barrier();
+
+    // Dequantize elements with cached scales
+    for (uint elem = tid; elem < pc.dim_param; elem += 256) {
+        uint blk_idx = elem >> 5;
+        float qval = float(embed_bytes[row_byte_off + blk_idx * 34 + 2 + (elem & 31)]);
+        output_vec[elem] = qval * blk_scales[blk_idx] * pc.embed_scale;
+    }
+}

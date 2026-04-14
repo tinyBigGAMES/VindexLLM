@@ -20,6 +20,7 @@ uses
   System.Classes,
   System.IOUtils,
   System.Math,
+  System.Diagnostics,
   System.Generics.Collections,
   VindexLLM.Utils,
   VindexLLM.GGUFReader,
@@ -28,16 +29,56 @@ uses
   VindexLLM.Attention,
   VindexLLM.Vindex,
   VindexLLM.Tokenizer,
-  VindexLLM.ChatTemplate;
+  VindexLLM.ChatTemplate,
+  VindexLLM.VirtualBuffer;
 
 // ============================================================================
-//  Push constant for GELU-mul shader
+//  Push constants for shaders
 // ============================================================================
 
 type
   TVdxGeluMulPush = record
     Count: UInt32;
   end;
+
+  TVdxVecAddPush = record
+    Count: UInt32;
+  end;
+
+  TVdxEmbedLookupPush = record
+    TokenId: UInt32;
+    DimParam: UInt32;    // hidden_dim/2 for F16, hidden_dim for Q8_0
+    EmbedScale: Single;
+  end;
+
+// ============================================================================
+//  Stop reason — why generation ended
+// ============================================================================
+
+  TVdxStopReason = (
+    srNone,              // Not yet generated
+    srEOS,               // End-of-sequence token
+    srStopToken,         // User-defined stop token (e.g., <end_of_turn>)
+    srMaxTokens,         // Reached max token limit
+    srCallbackStopped    // Token callback returned False
+  );
+
+// ============================================================================
+//  Inference stats — filled by Generate(), read via GetStats()
+// ============================================================================
+
+  TVdxInferenceStats = record
+    PrefillTokens: Integer;
+    PrefillTimeMs: Double;
+    PrefillTokPerSec: Double;
+    GeneratedTokens: Integer;
+    GenerationTimeMs: Double;
+    GenerationTokPerSec: Double;
+    TimeToFirstTokenMs: Double;
+    TotalTimeMs: Double;
+    StopReason: TVdxStopReason;
+  end;
+  PVdxInferenceStats = ^TVdxInferenceStats;
 
 // ============================================================================
 //  Token callback — return True to continue, False to stop generation
@@ -80,20 +121,24 @@ type
     FMaxSeqLen: UInt32;
 
     // Stop token IDs — generation stops when any of these are produced
-    // Populated from GGUF metadata (EOS + EOT), user can add more
     FStopTokenIds: TList<Integer>;
 
-    // Embedding (mmap'd from GGUF, F16)
+    // Embedding (mmap'd from GGUF)
     FEmbedPtr: PByte;
     FEmbedScale: Single;
+    FEmbedType: TVdxGGMLType;     // embedding tensor format (for unembedding matvec)
 
     // Per-layer weights
     FAttnWeights: array of TVdxAttnLayerWeights;
     FNormWeights: array of TVdxNormLayerWeights;
     FUpWeights: array of TVdxGpuBuffer;
+    FWeightType: TVdxGGMLType;         // weight tensor type (F16 or Q8_0)
 
     // Global weights
     FOutputNormGpu: TVdxGpuBuffer;
+
+    // GPU residual buffer — stays on GPU between layers (no CPU round-trip)
+    FResidualGpu: TVdxGpuBuffer;
 
     // Work GPU buffers
     FWorkBufA: TVdxGpuBuffer;      // normed residual [HiddenDim] F32
@@ -109,20 +154,41 @@ type
     FGeluMulDescPool: VkDescriptorPool;
     FGeluMulDescSet: VkDescriptorSet;
 
+    // Vec-add pipeline (GPU residual += branch output)
+    FVecAddShader: VkShaderModule;
+    FVecAddBundle: TVdxComputePipelineBundle;
+    FVecAddDescLayout: VkDescriptorSetLayout;
+    FVecAddDescPool: VkDescriptorPool;
+    FVecAddAttnDescSet: VkDescriptorSet;  // residual += attn output
+    FVecAddFFNDescSet: VkDescriptorSet;   // residual += ffn output
+
+    // GPU embedding lookup (eliminates CPU→GPU transfer per token)
+    FEmbedF16Shader: VkShaderModule;
+    FEmbedQ8Shader: VkShaderModule;
+    FEmbedF16Bundle: TVdxComputePipelineBundle;
+    FEmbedQ8Bundle: TVdxComputePipelineBundle;
+    FEmbedDescLayout: VkDescriptorSetLayout;
+    FEmbedDescPool: VkDescriptorPool;
+    FEmbedDescSet: VkDescriptorSet;
+
     // GPU unembedding (avoids slow CPU F16 scan)
-    FEmbedGpu: TVdxGpuBuffer;     // F16 embedding table on GPU [HiddenDim x VocabSize]
+    FEmbedGpu: TVdxGpuBuffer;     // F16 embedding table on GPU
     FLogitsBuf: TVdxGpuBuffer;    // F32 logits output [VocabSize], host-visible
 
-    // CPU-side arrays
+    // Pre-allocated CPU logits buffer (avoids per-token heap allocation)
+    FLogitsVBuf: TVdxVirtualBuffer<Single>;
+
+    // CPU-side embedding scratch (for F16→F32 conversion before upload)
     FResidual: array of Single;
-    FSavedResidual: array of Single;
-    FTempVec: array of Single;
+
+    // Stats — filled by Generate()
+    FStats: TVdxInferenceStats;
 
     // Private helpers
     function F16ToF32(const AVal: UInt16): Single;
     function UploadNormWeight(const ATensorName: string;
       const ACount: UInt32): TVdxGpuBuffer;
-    function UploadF16Tensor(const ATensorName: string): TVdxGpuBuffer;
+    function UploadWeightTensor(const ATensorName: string): TVdxGpuBuffer;
     procedure EmbedToken(const ATokenId: Integer);
     procedure RunLayerForward(const ALayer: Integer;
       const APosition: Integer);
@@ -132,27 +198,21 @@ type
     constructor Create(); override;
     destructor Destroy(); override;
 
-    // Load model from GGUF file — sets up Vulkan, loads all weights
     procedure LoadModel(const AGGUFPath: string);
 
-    // Set token callback (called per generated token, return False to stop)
     procedure SetTokenCallback(const ACallback: TVdxTokenCallback;
       const AUserData: Pointer);
 
-    // Generate response from prompt string
-    // Auto-wraps in chat template based on model architecture
-    // Returns full generated text
     function Generate(const APrompt: string;
       const AMaxTokens: Integer = 256): string;
 
-    // Release all resources
     procedure UnloadModel();
 
-    // Add a custom stop token ID (checked during generation)
     procedure AddStopToken(const ATokenId: Integer);
-
-    // Clear all user-added stop tokens (EOS/EOT from GGUF remain)
     procedure ClearStopTokens();
+
+    // Stats from last Generate() call — pointer to internal record
+    function GetStats(): PVdxInferenceStats;
   end;
 
 implementation
@@ -174,6 +234,7 @@ begin
   FModelLoaded := False;
   FArchitecture := '';
   FStopTokenIds := TList<Integer>.Create();
+  FLogitsVBuf := nil;
   FEmbedPtr := nil;
   FEmbedScale := 0.0;
 end;
@@ -253,10 +314,10 @@ begin
 end;
 
 // ============================================================================
-//  UploadF16Tensor — Upload raw F16 tensor to device-local GPU via staging
+//  UploadWeightTensor — Upload any weight tensor (F16/Q4_0) to device-local GPU
 // ============================================================================
 
-function TVdxInference.UploadF16Tensor(const ATensorName: string): TVdxGpuBuffer;
+function TVdxInference.UploadWeightTensor(const ATensorName: string): TVdxGpuBuffer;
 var
   LInfo: TVdxGGUFTensorInfo;
   LPtr: Pointer;
@@ -265,7 +326,11 @@ var
 begin
   LInfo := FReader.GetTensorInfo(ATensorName);
   LPtr := FReader.GetTensorDataPtr(ATensorName);
-  LSize := UInt64(LInfo.Dimensions[0]) * UInt64(LInfo.Dimensions[1]) * 2;
+  LSize := VdxGGMLTensorBytes(LInfo.TensorType,
+    LInfo.Dimensions[0], LInfo.Dimensions[1]);
+  TVdxUtils.FailIf(LSize = 0,
+    'Unsupported tensor type for %s: %s',
+    [ATensorName, VdxGGMLTypeName(LInfo.TensorType)]);
 
   LStaging := FCompute.CreateGpuBuffer(LSize,
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -282,24 +347,56 @@ begin
 end;
 
 // ============================================================================
-//  EmbedToken — Look up F16 embedding row, convert to F32, scale
+//  EmbedToken — GPU embedding lookup: read from embedding table on GPU,
+//  dequantize + scale, write to residual buffer. No CPU→GPU transfer.
+//  F32 fallback: CPU conversion + upload (rare, kept for completeness).
+//  Must be called inside an active batch (BeginBatch/EndBatch).
 // ============================================================================
 
 procedure TVdxInference.EmbedToken(const ATokenId: Integer);
 var
+  LPush: TVdxEmbedLookupPush;
   LI: Integer;
+  LOffset: UInt64;
 begin
-  for LI := 0 to Integer(FHiddenDim) - 1 do
-    FResidual[LI] := F16ToF32(
-      PWord(FEmbedPtr +
-        UInt64(ATokenId) * UInt64(FHiddenDim) * 2 +
-        UInt64(LI) * 2)^
-    ) * FEmbedScale;
+  if FEmbedType = gtF32 then
+  begin
+    // F32 fallback: CPU conversion + upload
+    LOffset := UInt64(ATokenId) * UInt64(FHiddenDim) * 4;
+    for LI := 0 to Integer(FHiddenDim) - 1 do
+      FResidual[LI] := PSingle(FEmbedPtr + LOffset + UInt64(LI) * 4)^
+        * FEmbedScale;
+    FCompute.UploadToBuffer(FResidualGpu, @FResidual[0],
+      UInt64(FHiddenDim) * SizeOf(Single));
+  end
+  else
+  begin
+    // GPU dispatch: F16 or Q8_0 embedding lookup
+    LPush.TokenId := UInt32(ATokenId);
+    LPush.EmbedScale := FEmbedScale;
+
+    if FEmbedType = gtQ8_0 then
+    begin
+      LPush.DimParam := FHiddenDim;
+      FCompute.DispatchComputeWithPush(
+        FEmbedQ8Bundle.Pipeline, FEmbedQ8Bundle.PipelineLayout,
+        FEmbedDescSet, @LPush, SizeOf(LPush), 1);
+    end
+    else
+    begin
+      LPush.DimParam := FHiddenDim div 2;
+      FCompute.DispatchComputeWithPush(
+        FEmbedF16Bundle.Pipeline, FEmbedF16Bundle.PipelineLayout,
+        FEmbedDescSet, @LPush, SizeOf(LPush),
+        (FHiddenDim div 2 + 255) div 256);
+    end;
+  end;
 end;
 
 // ============================================================================
 //  RunLayerForward — Process one transformer layer (attn + FFN)
 //  Sandwich norm pattern: PreNorm → Op → PostNorm → residual add
+//  All operations recorded into the active batch — no individual submits
 // ============================================================================
 
 procedure TVdxInference.RunLayerForward(const ALayer: Integer;
@@ -308,26 +405,25 @@ var
   LBufSize: UInt64;
   LTheta: Single;
   LGeluPush: TVdxGeluMulPush;
-  LI: Integer;
+  LVecAddPush: TVdxVecAddPush;
 begin
   LBufSize := UInt64(FHiddenDim) * SizeOf(Single);
 
   // === Attention branch: x = x + PostAttnNorm(Attn(PreAttnNorm(x))) ===
 
-  // Save residual for the residual connection
-  Move(FResidual[0], FSavedResidual[0], LBufSize);
+  // Copy residual to work buffer for in-place norming (GPU→GPU copy)
+  FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
 
-  // Upload residual to GPU, apply PreAttnNorm in-place
-  FCompute.UploadToBuffer(FWorkBufA, @FResidual[0], LBufSize);
+  // PreAttnNorm in-place on work buffer
   FNorm.Apply(FWorkBufA, FNormWeights[ALayer].AttnNormGpu, FHiddenDim);
 
-  // Full layers [5,11,17,23,29] use theta=1M, sliding layers use theta=10K
+  // Per-layer RoPE theta: full layers use 1M, sliding layers use 10K
   if ALayer mod 6 = 5 then
     LTheta := 1000000.0
   else
     LTheta := 10000.0;
 
-  // Run full attention: normed input → attention output
+  // Full attention: normed input → attention output
   FAttn.Forward(
     FWorkBufA,
     FAttnWeights[ALayer],
@@ -338,33 +434,34 @@ begin
     LTheta,
     FAttnOutBuf);
 
-  // Apply PostAttnNorm on attention output in-place
+  // PostAttnNorm on attention output
   FNorm.Apply(FAttnOutBuf,
     FNormWeights[ALayer].PostAttnNormGpu, FHiddenDim);
 
-  // Download post-normed attention output, add to saved residual
-  FCompute.DownloadFromBuffer(FAttnOutBuf, @FTempVec[0], LBufSize);
-  for LI := 0 to Integer(FHiddenDim) - 1 do
-    FResidual[LI] := FSavedResidual[LI] + FTempVec[LI];
+  // GPU vec_add: residual += attn_output (no CPU round-trip)
+  LVecAddPush.Count := FHiddenDim;
+  FCompute.DispatchComputeWithPush(
+    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
+    FVecAddAttnDescSet, @LVecAddPush, SizeOf(LVecAddPush),
+    (FHiddenDim + 255) div 256);
 
   // === FFN branch: x = x + PostFFNNorm(FFN(PreFFNNorm(x))) ===
 
-  // Save residual for the residual connection
-  Move(FResidual[0], FSavedResidual[0], LBufSize);
+  // Copy residual to work buffer for in-place norming
+  FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
 
-  // Upload residual to GPU, apply PreFFNNorm in-place
-  FCompute.UploadToBuffer(FWorkBufA, @FResidual[0], LBufSize);
+  // PreFFNNorm in-place on work buffer
   FNorm.Apply(FWorkBufA, FNormWeights[ALayer].FFNNormGpu, FHiddenDim);
 
   // Dense FFN: gate(x), up(x), GELU(gate)*up, down(hidden)
 
   // gate(x) → FGateBuf [FFNWidth]
   FAttn.TestMatVec(FVindex.GetLayer(ALayer).GateGpuBuffer,
-    FWorkBufA, FGateBuf, FHiddenDim, FFFNWidth);
+    FWorkBufA, FGateBuf, FHiddenDim, FFFNWidth, FWeightType);
 
   // up(x) → FUpBuf [FFNWidth]
   FAttn.TestMatVec(FUpWeights[ALayer],
-    FWorkBufA, FUpBuf, FHiddenDim, FFFNWidth);
+    FWorkBufA, FUpBuf, FHiddenDim, FFFNWidth, FWeightType);
 
   // GELU(gate) * up → FGateBuf [FFNWidth] in-place
   LGeluPush.Count := FFFNWidth;
@@ -375,21 +472,24 @@ begin
 
   // down(hidden) → FFFNOutBuf [HiddenDim]
   FAttn.TestMatVec(FVindex.GetLayer(ALayer).DownGpuBuffer,
-    FGateBuf, FFFNOutBuf, FFFNWidth, FHiddenDim);
+    FGateBuf, FFFNOutBuf, FFFNWidth, FHiddenDim, FWeightType);
 
-  // Apply PostFFNNorm to FFN output
+  // PostFFNNorm on FFN output
   FNorm.Apply(FFFNOutBuf,
     FNormWeights[ALayer].PostFFNNormGpu, FHiddenDim);
 
-  // Download post-normed FFN output, add to saved residual
-  FCompute.DownloadFromBuffer(FFFNOutBuf, @FTempVec[0], LBufSize);
-  for LI := 0 to Integer(FHiddenDim) - 1 do
-    FResidual[LI] := FSavedResidual[LI] + FTempVec[LI];
+  // GPU vec_add: residual += ffn_output (no CPU round-trip)
+  LVecAddPush.Count := FHiddenDim;
+  FCompute.DispatchComputeWithPush(
+    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
+    FVecAddFFNDescSet, @LVecAddPush, SizeOf(LVecAddPush),
+    (FHiddenDim + 255) div 256);
 end;
 
 // ============================================================================
-//  RunUnembedding — Apply final norm, scan vocab for argmax (greedy)
-//  Returns the token ID with the highest logit score
+//  RunUnembedding — Apply final norm, GPU matvec for logits, CPU argmax
+//  Called inside an active batch — records norm + matvec, then EndBatch
+//  is called by the caller before downloading logits
 // ============================================================================
 
 function TVdxInference.RunUnembedding(): Integer;
@@ -397,38 +497,37 @@ var
   LBufSize: UInt64;
   LBestId: Integer;
   LBestScore: Single;
-  LLogits: array of Single;
+  LLogits: PSingle;
   LI: Integer;
 begin
   LBufSize := UInt64(FHiddenDim) * SizeOf(Single);
 
-  // Apply final RMSNorm (output_norm) to the residual
-  FCompute.UploadToBuffer(FWorkBufA, @FResidual[0], LBufSize);
+  // Batched: copy residual → work, norm, matvec → logits
+  FCompute.BeginBatch();
+
+  FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
   FNorm.Apply(FWorkBufA, FOutputNormGpu, FHiddenDim);
-
-  // GPU matvec: embed_table[HiddenDim x VocabSize] × normed_residual[HiddenDim]
-  // → logits[VocabSize] in one dispatch
   FAttn.TestMatVec(FEmbedGpu, FWorkBufA, FLogitsBuf,
-    FHiddenDim, UInt32(FVocabSize));
+    FHiddenDim, UInt32(FVocabSize), FEmbedType);
 
-  // Download logits and find argmax (simple F32 scan)
-  SetLength(LLogits, FVocabSize);
-  FCompute.DownloadFromBuffer(FLogitsBuf, @LLogits[0],
+  FCompute.EndBatch();
+
+  // Download logits into pre-allocated VirtualBuffer (no heap allocation)
+  FCompute.DownloadFromBuffer(FLogitsBuf, FLogitsVBuf.Memory,
     UInt64(FVocabSize) * SizeOf(Single));
 
+  // Argmax over logits
+  LLogits := PSingle(FLogitsVBuf.Memory);
   LBestId := 0;
-  LBestScore := LLogits[0];
+  LBestScore := LLogits^;
   for LI := 1 to FVocabSize - 1 do
   begin
-    if LLogits[LI] > LBestScore then
+    if PSingle(PByte(LLogits) + UInt64(LI) * SizeOf(Single))^ > LBestScore then
     begin
       LBestId := LI;
-      LBestScore := LLogits[LI];
+      LBestScore := PSingle(PByte(LLogits) + UInt64(LI) * SizeOf(Single))^;
     end;
   end;
-
-  // Download normed residual back for next iteration's embedding overwrite
-  FCompute.DownloadFromBuffer(FWorkBufA, @FResidual[0], LBufSize);
 
   Result := LBestId;
 end;
@@ -478,12 +577,18 @@ begin
   FNumQHeads := FReader.GetMetadataUInt32(FArchitecture + '.attention.head_count');
   FNumKVHeads := FReader.GetMetadataUInt32(FArchitecture + '.attention.head_count_kv');
 
-  // Derive head_dim from Q weight tensor shape: [hidden_dim, num_q_heads * head_dim]
+  // Derive head_dim from Q weight tensor shape
   LQInfo := FReader.GetTensorInfo('blk.0.attn_q.weight');
   FHeadDim := UInt32(LQInfo.Dimensions[1]) div FNumQHeads;
-
-  // Max sequence length for KV cache allocation
   FMaxSeqLen := 2048;
+
+  // Detect weight tensor type (F16, Q4_0, etc.) from first layer's Q weight
+  FWeightType := LQInfo.TensorType;
+  Status('Weight type: %s', [VdxGGMLTypeName(FWeightType)]);
+
+  // Detect embedding tensor type
+  FEmbedType := FReader.GetTensorInfo('token_embd.weight').TensorType;
+  Status('Embedding type: %s', [VdxGGMLTypeName(FEmbedType)]);
 
   Status('Config: layers=%d hidden=%d ffn=%d heads=%d/%d head_dim=%d',
     [FNumLayers, FHiddenDim, FFFNWidth, FNumQHeads, FNumKVHeads, FHeadDim]);
@@ -496,11 +601,22 @@ begin
   TVdxUtils.FailIf(not FVindex.BuildFromGGUF(FReader),
     'Failed to build vindex', []);
 
-  // Create work buffers (host-visible coherent for upload/download)
+  // Create work buffers
   LBufSize := UInt64(FHiddenDim) * SizeOf(Single);
-  FWorkBufA := FCompute.CreateGpuBuffer(LBufSize,
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+
+  // GPU residual — lives on GPU between layers, host-visible for initial upload
+  FResidualGpu := FCompute.CreateGpuBuffer(LBufSize,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT or
+    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+  // Work buffer — receives copy of residual for in-place norming
+  FWorkBufA := FCompute.CreateGpuBuffer(LBufSize,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+  // Attention and FFN output buffers
   FAttnOutBuf := FCompute.CreateGpuBuffer(LBufSize,
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -529,10 +645,27 @@ begin
   FGeluMulBundle := FCompute.CreateComputePipelineWithPush(
     FGeluMulShader, 'main', FGeluMulDescLayout, SizeOf(TVdxGeluMulPush));
 
-  // Pre-allocate GELU descriptor set (buffers are fixed)
   FGeluMulDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
   FGeluMulDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FGeluMulDescPool, FGeluMulDescLayout, [FGateBuf, FUpBuf]);
+
+  // --- Vec-add pipeline (GPU residual += branch output) ---
+  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\vec_add.spv');
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FVecAddShader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+  FVecAddDescLayout := FCompute.CreateStorageDescriptorSetLayout(2);
+  FVecAddBundle := FCompute.CreateComputePipelineWithPush(
+    FVecAddShader, 'main', FVecAddDescLayout, SizeOf(TVdxVecAddPush));
+
+  // Pre-allocate two descriptor sets: residual+=attn, residual+=ffn
+  FVecAddDescPool := FCompute.CreateDescriptorPoolForStorage(2, 4);
+  FVecAddAttnDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FVecAddDescPool, FVecAddDescLayout, [FResidualGpu, FAttnOutBuf]);
+  FVecAddFFNDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FVecAddDescPool, FVecAddDescLayout, [FResidualGpu, FFFNOutBuf]);
 
   // --- Upload all weights to VRAM ---
   Status('Uploading weights to GPU...');
@@ -551,10 +684,10 @@ begin
   Status('  Uploading FFN up weights (%d layers)...', [FNumLayers]);
   SetLength(FUpWeights, FNumLayers);
   for LLayer := 0 to Integer(FNumLayers) - 1 do
-    FUpWeights[LLayer] := UploadF16Tensor(
+    FUpWeights[LLayer] := UploadWeightTensor(
       Format('blk.%d.ffn_up.weight', [LLayer]));
 
-  // Norm weights (all 6 per layer: pre/post attn, pre/post FFN, QK-norm)
+  // Norm weights (all 6 per layer)
   Status('  Uploading norm weights (%d layers)...', [FNumLayers]);
   SetLength(FNormWeights, FNumLayers);
   for LLayer := 0 to Integer(FNumLayers) - 1 do
@@ -595,7 +728,6 @@ begin
       Integer(FReader.GetMetadataUInt32('tokenizer.ggml.eot_token_id')));
 
   // Probe vocab for common end-of-turn tokens across model families
-  // Data-driven: only adds tokens that actually exist in this model's vocab
   for LProbeIdx := 0 to 4 do
   begin
     case LProbeIdx of
@@ -617,15 +749,43 @@ begin
 
   Status('Stop tokens: %d configured', [FStopTokenIds.Count]);
 
-  // --- Get embedding table pointer (mmap'd F16 data) ---
+  // --- Get embedding table pointer (mmap'd data) ---
   FEmbedPtr := PByte(FReader.GetTensorDataPtr('token_embd.weight'));
   TVdxUtils.FailIf(FEmbedPtr = nil,
     'token_embd.weight not found in GGUF', []);
+  TVdxUtils.FailIf((FEmbedType <> gtF16) and (FEmbedType <> gtF32) and (FEmbedType <> gtQ8_0),
+    'Unsupported embedding type: %s (need F16, F32, or Q8_0)',
+    [VdxGGMLTypeName(FEmbedType)]);
   FEmbedScale := Sqrt(Single(FHiddenDim));
 
-  // Upload embedding table to GPU for fast unembedding (F16, ~1.28 GB)
+  // Upload embedding table to GPU for fast unembedding
   Status('  Uploading embedding table to GPU...');
-  FEmbedGpu := UploadF16Tensor('token_embd.weight');
+  FEmbedGpu := UploadWeightTensor('token_embd.weight');
+
+  // --- GPU embedding lookup pipeline ---
+  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\embed_lookup_f16.spv');
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FEmbedF16Shader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\embed_lookup_q8.spv');
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FEmbedQ8Shader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  FEmbedDescLayout := FCompute.CreateStorageDescriptorSetLayout(2);
+  FEmbedF16Bundle := FCompute.CreateComputePipelineWithPush(
+    FEmbedF16Shader, 'main', FEmbedDescLayout, SizeOf(TVdxEmbedLookupPush));
+  FEmbedQ8Bundle := FCompute.CreateComputePipelineWithPush(
+    FEmbedQ8Shader, 'main', FEmbedDescLayout, SizeOf(TVdxEmbedLookupPush));
+
+  FEmbedDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
+  FEmbedDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FEmbedDescPool, FEmbedDescLayout, [FEmbedGpu, FResidualGpu]);
 
   // Logits buffer: F32 x VocabSize, host-visible for CPU argmax
   FLogitsBuf := FCompute.CreateGpuBuffer(
@@ -633,10 +793,11 @@ begin
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-  // --- Allocate CPU arrays ---
+  // Pre-allocate CPU logits buffer (reused every token, no heap churn)
+  FLogitsVBuf := TVdxVirtualBuffer<Single>.Create(FVocabSize);
+
+  // --- Allocate CPU embedding scratch array ---
   SetLength(FResidual, FHiddenDim);
-  SetLength(FSavedResidual, FHiddenDim);
-  SetLength(FTempVec, FHiddenDim);
 
   FModelLoaded := True;
   Status('Model loaded successfully');
@@ -673,7 +834,17 @@ begin
 end;
 
 // ============================================================================
+//  GetStats — Return pointer to internal stats record
+// ============================================================================
+
+function TVdxInference.GetStats(): PVdxInferenceStats;
+begin
+  Result := @FStats;
+end;
+
+// ============================================================================
 //  Generate — Tokenize, prefill, then autoregressive token generation
+//  Uses batched dispatch: one GPU submit per token for all 34 layers
 // ============================================================================
 
 function TVdxInference.Generate(const APrompt: string;
@@ -688,8 +859,15 @@ var
   LTokenStr: string;
   LResult: TStringBuilder;
   LGenerated: Integer;
+  LTotalWatch: TStopwatch;
+  LPrefillWatch: TStopwatch;
+  LGenWatch: TStopwatch;
 begin
   TVdxUtils.FailIf(not FModelLoaded, 'Model not loaded', []);
+
+  // Reset stats
+  FillChar(FStats, SizeOf(FStats), 0);
+  FStats.StopReason := srNone;
 
   // Format prompt with chat template
   LFormatted := TVdxChatTemplate.FormatPrompt(FArchitecture, APrompt);
@@ -697,29 +875,38 @@ begin
   // Tokenize (with BOS)
   LTokenIds := FTokenizer.Encode(LFormatted, True);
   LTokenCount := Length(LTokenIds);
-  Status('Prompt: %d tokens, generating up to %d tokens',
-    [LTokenCount, AMaxTokens]);
 
+  LTotalWatch := TStopwatch.StartNew();
   LResult := TStringBuilder.Create();
   try
     // --- Prefill: process all prompt tokens through the model ---
+    LPrefillWatch := TStopwatch.StartNew();
     for LPos := 0 to LTokenCount - 1 do
     begin
+      FCompute.BeginBatch();
       EmbedToken(LTokenIds[LPos]);
       for LLayer := 0 to Integer(FNumLayers) - 1 do
         RunLayerForward(LLayer, LPos);
+      FCompute.EndBatch();
     end;
+    LPrefillWatch.Stop();
 
     // --- Autoregressive generation ---
+    LGenWatch := TStopwatch.StartNew();
     LGenerated := 0;
     while LGenerated < AMaxTokens do
     begin
-      // Unembedding: find top-1 token (greedy)
       LNextTokenId := RunUnembedding();
 
-      // Check for stop tokens (EOS, EOT, user-defined)
+      // Check for stop tokens
       if FStopTokenIds.Contains(LNextTokenId) then
+      begin
+        if LNextTokenId = FTokenizer.GetEosId() then
+          FStats.StopReason := srEOS
+        else
+          FStats.StopReason := srStopToken;
         Break;
+      end;
 
       // Decode token and append to result
       LTokenStr := FTokenizer.Decode(
@@ -730,17 +917,44 @@ begin
       if FTokenCallback.IsAssigned() then
       begin
         if not FTokenCallback.Callback(LTokenStr, FTokenCallback.UserData) then
+        begin
+          FStats.StopReason := srCallbackStopped;
+          Inc(LGenerated);
           Break;
+        end;
       end;
 
       // Feed predicted token back into the model
       Inc(LGenerated);
+
+      FCompute.BeginBatch();
       EmbedToken(LNextTokenId);
       for LLayer := 0 to Integer(FNumLayers) - 1 do
         RunLayerForward(LLayer, LTokenCount + LGenerated - 1);
+      FCompute.EndBatch();
     end;
+    LGenWatch.Stop();
 
-    Status('Generated %d tokens', [LGenerated]);
+    // Max tokens reached without a stop token
+    if FStats.StopReason = srNone then
+      FStats.StopReason := srMaxTokens;
+
+    LTotalWatch.Stop();
+
+    // Fill stats
+    FStats.PrefillTokens := LTokenCount;
+    FStats.PrefillTimeMs := LPrefillWatch.Elapsed.TotalMilliseconds;
+    if FStats.PrefillTimeMs > 0 then
+      FStats.PrefillTokPerSec := (LTokenCount * 1000.0) / FStats.PrefillTimeMs;
+
+    FStats.GeneratedTokens := LGenerated;
+    FStats.GenerationTimeMs := LGenWatch.Elapsed.TotalMilliseconds;
+    if FStats.GenerationTimeMs > 0 then
+      FStats.GenerationTokPerSec := (LGenerated * 1000.0) / FStats.GenerationTimeMs;
+
+    FStats.TimeToFirstTokenMs := LPrefillWatch.Elapsed.TotalMilliseconds;
+    FStats.TotalTimeMs := LTotalWatch.Elapsed.TotalMilliseconds;
+
     Result := LResult.ToString();
   finally
     LResult.Free();
@@ -764,7 +978,22 @@ begin
   FCompute.DestroyDescriptorSetLayoutHandle(FGeluMulDescLayout);
   FCompute.DestroyShaderModuleHandle(FGeluMulShader);
 
+  // Free vec-add pipeline
+  FCompute.DestroyDescriptorPoolHandle(FVecAddDescPool);
+  FCompute.DestroyComputePipelineBundle(FVecAddBundle);
+  FCompute.DestroyDescriptorSetLayoutHandle(FVecAddDescLayout);
+  FCompute.DestroyShaderModuleHandle(FVecAddShader);
+
+  // Free embed lookup pipeline
+  FCompute.DestroyDescriptorPoolHandle(FEmbedDescPool);
+  FCompute.DestroyComputePipelineBundle(FEmbedF16Bundle);
+  FCompute.DestroyComputePipelineBundle(FEmbedQ8Bundle);
+  FCompute.DestroyDescriptorSetLayoutHandle(FEmbedDescLayout);
+  FCompute.DestroyShaderModuleHandle(FEmbedF16Shader);
+  FCompute.DestroyShaderModuleHandle(FEmbedQ8Shader);
+
   // Free work buffers
+  FCompute.DestroyGpuBuffer(FResidualGpu);
   FCompute.DestroyGpuBuffer(FWorkBufA);
   FCompute.DestroyGpuBuffer(FAttnOutBuf);
   FCompute.DestroyGpuBuffer(FGateBuf);
@@ -777,6 +1006,9 @@ begin
   // Free embedding GPU + logits buffer
   FCompute.DestroyGpuBuffer(FEmbedGpu);
   FCompute.DestroyGpuBuffer(FLogitsBuf);
+
+  // Free pre-allocated CPU logits buffer
+  FreeAndNil(FLogitsVBuf);
 
   // Free per-layer weights
   for LLayer := 0 to Integer(FNumLayers) - 1 do
@@ -815,8 +1047,6 @@ begin
   FNormWeights := nil;
   FUpWeights := nil;
   FResidual := nil;
-  FSavedResidual := nil;
-  FTempVec := nil;
   FEmbedPtr := nil;
   FModelLoaded := False;
 

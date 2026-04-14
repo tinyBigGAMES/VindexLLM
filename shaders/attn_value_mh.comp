@@ -1,0 +1,65 @@
+#version 450
+
+// Multi-Head Attention Value: weighted sum of V cache vectors for ALL Q heads
+// in a single 2D dispatch, eliminating 7 of 8 per-head value dispatches.
+//
+// output[q_head*head_dim + d] =
+//   sum over pos: scores[q_head*max_seq + pos] * v_cache[kv_head*max_seq*head_dim + pos*head_dim + d]
+//
+// GQA: kv_head = q_head / gqa_ratio
+//
+// Dispatch: (ceil(head_dim / 256), num_q_heads, 1)
+//
+// Bindings:
+//   0 = scores (float[], num_q_heads * max_seq, attention weights after softmax)
+//   1 = v_cache (float[], all KV heads x max_seq x head_dim)
+//   2 = output (float[], all Q heads concatenated)
+//
+// Push constants:
+//   head_dim    = dimension per head (256)
+//   seq_len     = number of positions in KV cache
+//   max_seq     = max sequence length (stride between heads in scores buffer)
+//   num_q_heads = number of query heads (8)
+//   gqa_ratio   = num_q_heads / num_kv_heads (2 for Gemma 3)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint seq_len;
+    uint max_seq;
+    uint num_q_heads;
+    uint gqa_ratio;
+} pc;
+
+layout(std430, binding = 0) readonly buffer ScoresBuf {
+    float scores[];
+};
+
+layout(std430, binding = 1) readonly buffer VCacheBuf {
+    float v_cache[];
+};
+
+layout(std430, binding = 2) buffer OutputBuf {
+    float output_vec[];
+};
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    uint q_head = gl_WorkGroupID.y;
+
+    if (d >= pc.head_dim || q_head >= pc.num_q_heads)
+        return;
+
+    uint kv_head = q_head / pc.gqa_ratio;
+    uint score_base = q_head * pc.max_seq;
+    uint v_off = kv_head * pc.max_seq * pc.head_dim;
+    uint out_off = q_head * pc.head_dim;
+
+    float acc = 0.0;
+    for (uint pos = 0; pos < pc.seq_len; pos++) {
+        acc += scores[score_base + pos] * v_cache[v_off + pos * pc.head_dim + d];
+    }
+
+    output_vec[out_off + d] = acc;
+}

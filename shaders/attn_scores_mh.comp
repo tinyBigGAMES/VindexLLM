@@ -1,0 +1,66 @@
+#version 450
+
+// Multi-Head Attention Scores: compute scaled dot products for ALL Q heads
+// in a single 2D dispatch, eliminating 7 of 8 per-head score dispatches.
+//
+// score[q_head * max_seq + pos] =
+//   dot(q[q_head*head_dim..], k_cache[kv_head*max_seq*head_dim + pos*head_dim..]) * scale
+//
+// GQA: kv_head = q_head / gqa_ratio
+//
+// Dispatch: (ceil(seq_len / 256), num_q_heads, 1)
+//
+// Bindings:
+//   0 = q_buf (float[], all Q heads concatenated)
+//   1 = k_cache (float[], all KV heads x max_seq x head_dim)
+//   2 = scores (float[], num_q_heads x max_seq elements, output)
+//
+// Push constants:
+//   head_dim    = dimension per head (256)
+//   seq_len     = number of positions in KV cache (including current)
+//   max_seq     = max sequence length (stride between heads in scores buffer)
+//   scale       = 1.0 / sqrt(head_dim)
+//   num_q_heads = number of query heads (8)
+//   gqa_ratio   = num_q_heads / num_kv_heads (2 for Gemma 3)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  seq_len;
+    uint  max_seq;
+    float scale;
+    uint  num_q_heads;
+    uint  gqa_ratio;
+} pc;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+    float q_buf[];
+};
+
+layout(std430, binding = 1) readonly buffer KCacheBuf {
+    float k_cache[];
+};
+
+layout(std430, binding = 2) writeonly buffer ScoresBuf {
+    float scores[];
+};
+
+void main() {
+    uint pos = gl_GlobalInvocationID.x;
+    uint q_head = gl_WorkGroupID.y;
+
+    if (pos >= pc.seq_len || q_head >= pc.num_q_heads)
+        return;
+
+    uint kv_head = q_head / pc.gqa_ratio;
+    uint q_off = q_head * pc.head_dim;
+    uint k_base = kv_head * pc.max_seq * pc.head_dim + pos * pc.head_dim;
+
+    float acc = 0.0;
+    for (uint d = 0; d < pc.head_dim; d++) {
+        acc += q_buf[q_off + d] * k_cache[k_base + d];
+    }
+
+    scores[q_head * pc.max_seq + pos] = acc * pc.scale;
+}

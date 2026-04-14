@@ -1,0 +1,47 @@
+#version 450
+
+// GPU Embedding Lookup (F16): read one row from F16 embedding table,
+// convert to F32 with scaling, write to residual buffer.
+// Eliminates CPU F16→F32 conversion + PCIe upload per token.
+//
+// Dispatch: (ceil(hidden_dim/2 / 256), 1, 1)
+//
+// Bindings:
+//   0 = embedding table (uint[], packed F16 pairs, row-major)
+//   1 = output residual (float[], hidden_dim elements)
+//
+// Push constants:
+//   token_id       = vocabulary index to look up
+//   dim_param      = hidden_dim / 2 (number of packed F16 pairs per row)
+//   embed_scale    = sqrt(hidden_dim) scaling factor
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  token_id;
+    uint  dim_param;
+    float embed_scale;
+} pc;
+
+layout(std430, binding = 0) readonly buffer EmbedBuf {
+    uint embed_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuf {
+    float output_vec[];
+};
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+
+    if (d >= pc.dim_param)
+        return;
+
+    uint base = pc.token_id * pc.dim_param;
+    uint packed = embed_data[base + d];
+    vec2 unpacked = unpackHalf2x16(packed);
+
+    uint dim = d * 2;
+    output_vec[dim] = unpacked.x * pc.embed_scale;
+    output_vec[dim + 1] = unpacked.y * pc.embed_scale;
+}
