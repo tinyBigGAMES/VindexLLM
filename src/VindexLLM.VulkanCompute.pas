@@ -817,6 +817,11 @@ type
     procedure BeginBatch();
     procedure EndBatch();
 
+    // Explicit memory barrier — caller inserts only where true data
+    // dependencies exist (write→read on the same buffer).  No-op outside
+    // batch mode because non-batch dispatches are fully synchronised.
+    procedure BatchBarrier();
+
     // Cleanup helpers
     procedure DestroyDescriptorSetLayoutHandle(const ALayout: VkDescriptorSetLayout);
     procedure DestroyDescriptorPoolHandle(const APool: VkDescriptorPool);
@@ -1454,12 +1459,7 @@ begin
   FvkCmdBindDescriptorSets(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipelineLayout, 0, 1, @ADescSet, 0, nil);
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
 
-  if FBatchMode then
-  begin
-    // Batch: just insert barrier, no submit
-    InsertBatchBarrier();
-  end
-  else
+  if not FBatchMode then
   begin
     // Non-batch: end + submit + fence
     CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
@@ -1471,6 +1471,7 @@ begin
     CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
     CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
   end;
+  // Batch mode: caller is responsible for calling BatchBarrier() where needed
 end;
 
 procedure TVdxVulkanCompute.DispatchComputeWithPush(const APipeline: VkPipeline; const APipelineLayout: VkPipelineLayout; const ADescSet: VkDescriptorSet; const APushData: Pointer; const APushSize: UInt32; const AGroupsX: UInt32; const AGroupsY: UInt32; const AGroupsZ: UInt32);
@@ -1491,11 +1492,7 @@ begin
   FvkCmdPushConstants(FCommandBuffer, APipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, APushSize, APushData);
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
 
-  if FBatchMode then
-  begin
-    InsertBatchBarrier();
-  end
-  else
+  if not FBatchMode then
   begin
     CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
     FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
@@ -1506,6 +1503,7 @@ begin
     CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
     CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
   end;
+  // Batch mode: caller is responsible for calling BatchBarrier() where needed
 end;
 
 // ============================================================================
@@ -1532,11 +1530,7 @@ begin
   LCopyRegion.size := ASize;
   FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
 
-  if FBatchMode then
-  begin
-    InsertBatchBarrier();
-  end
-  else
+  if not FBatchMode then
   begin
     CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
     FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
@@ -1547,6 +1541,7 @@ begin
     CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
     CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
   end;
+  // Batch mode: caller is responsible for calling BatchBarrier() where needed
 end;
 
 procedure TVdxVulkanCompute.CopyBufferRegion(const ASrc: TVdxGpuBuffer;
@@ -1571,11 +1566,7 @@ begin
   LCopyRegion.size := ASize;
   FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
 
-  if FBatchMode then
-  begin
-    InsertBatchBarrier();
-  end
-  else
+  if not FBatchMode then
   begin
     CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
     FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
@@ -1586,6 +1577,7 @@ begin
     CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
     CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
   end;
+  // Batch mode: caller is responsible for calling BatchBarrier() where needed
 end;
 
 // ============================================================================
@@ -1611,6 +1603,12 @@ begin
     1, @LBarrier,
     0, nil,
     0, nil);
+end;
+
+procedure TVdxVulkanCompute.BatchBarrier();
+begin
+  if FBatchMode then
+    InsertBatchBarrier();
 end;
 
 procedure TVdxVulkanCompute.BeginBatch();

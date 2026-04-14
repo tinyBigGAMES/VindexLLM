@@ -623,12 +623,14 @@ begin
   LHeadBytes := UInt64(FHeadDim) * SizeOf(Single);
   LKVHeadBytes := UInt64(FMaxSeqLen) * FHeadDim * SizeOf(Single);
   // ---- Step 1: Q/K/V projections (matvec — F16 or Q4_0) ----
+  // All three read AInputBuf and write separate output buffers → independent
   DispatchMatVec(AWeights.QWeightGpu, AInputBuf, FQBuf,
     FHiddenDim, FNumQHeads * FHeadDim, AWeights.WeightType);
   DispatchMatVec(AWeights.KWeightGpu, AInputBuf, FKBuf,
     FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
   DispatchMatVec(AWeights.VWeightGpu, AInputBuf, FVBuf,
     FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
+  FCompute.BatchBarrier(); // Q/K/VBuf ready for QK-norm
 
   // ---- Step 2: QK-norm on Q (8 heads) and K (4 heads) ----
   LQKNormPush.HeadDim := FHeadDim;
@@ -641,12 +643,13 @@ begin
     FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
     FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumQHeads);
 
-  // QK-norm on K
+  // QK-norm on K (independent of Q — writes different buffer)
   LQKNormPush.NumHeads := FNumKVHeads;
   FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [FKBuf, AKNormBuf]);
   FCompute.DispatchComputeWithPush(
     FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
     FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumKVHeads);
+  FCompute.BatchBarrier(); // Q/KBuf normed, ready for RoPE
   // ---- Step 3: RoPE on Q and K ----
   LRoPEPush.HeadDim := FHeadDim;
   LRoPEPush.Position := UInt32(APosition);
@@ -659,12 +662,13 @@ begin
     FRoPEBundle.Pipeline, FRoPEBundle.PipelineLayout,
     FRoPEDescSet, @LRoPEPush, SizeOf(LRoPEPush), FNumQHeads);
 
-  // RoPE on K (4 heads)
+  // RoPE on K (4 heads — independent of Q, writes different buffer)
   LRoPEPush.NumHeads := FNumKVHeads;
   FCompute.UpdateDescriptorSetBuffers(FRoPEDescSet, [FKBuf]);
   FCompute.DispatchComputeWithPush(
     FRoPEBundle.Pipeline, FRoPEBundle.PipelineLayout,
     FRoPEDescSet, @LRoPEPush, SizeOf(LRoPEPush), FNumKVHeads);
+  FCompute.BatchBarrier(); // Q/KBuf with RoPE applied, ready for KV cache + attn
   // ---- Step 4: Store K and V in KV cache at current position ----
   // Cache layout: [NumKVHeads × MaxSeqLen × HeadDim]
   // For each KV head h, copy HeadDim floats from K/VBuf to cache
@@ -686,6 +690,7 @@ begin
       (UInt64(LKVHead) * FMaxSeqLen + UInt64(APosition)) * FHeadDim * SizeOf(Single),
       LHeadBytes);
   end;
+  FCompute.BatchBarrier(); // KV cache updated, ready for attention scores
   // ---- Step 5: Multi-head attention (all heads in 3 dispatches) ----
 
   // 5a. All heads' scores in one 2D dispatch
@@ -702,6 +707,7 @@ begin
     FAttnScoresMHBundle.Pipeline, FAttnScoresMHBundle.PipelineLayout,
     FScoresDescSet, @LScoresMHPush, SizeOf(LScoresMHPush),
     (LSeqLen + 255) div 256, FNumQHeads);
+  FCompute.BatchBarrier(); // ScoresBuf ready for softmax
 
   // 5b. All heads' softmax in one dispatch (one workgroup per head)
   LSoftmaxMHPush.SeqLen := LSeqLen;
@@ -713,6 +719,7 @@ begin
     FSoftmaxMHBundle.Pipeline, FSoftmaxMHBundle.PipelineLayout,
     FSoftmaxDescSet, @LSoftmaxMHPush, SizeOf(LSoftmaxMHPush),
     FNumQHeads);
+  FCompute.BatchBarrier(); // Softmax weights ready for value
 
   // 5c. All heads' weighted V sum in one 2D dispatch
   LValueMHPush.HeadDim := FHeadDim;
@@ -727,10 +734,12 @@ begin
     FAttnValueMHBundle.Pipeline, FAttnValueMHBundle.PipelineLayout,
     FValueDescSet, @LValueMHPush, SizeOf(LValueMHPush),
     (FHeadDim + 255) div 256, FNumQHeads);
+  FCompute.BatchBarrier(); // AttnOutBuf ready for O matvec
   // ---- Step 6: Output projection ----
   // O: W[NumQHeads*HeadDim × HiddenDim] × attn_out → output
   DispatchMatVec(AWeights.OWeightGpu, FAttnOutBuf, AOutputBuf,
     FNumQHeads * FHeadDim, FHiddenDim, AWeights.WeightType);
+  FCompute.BatchBarrier(); // AOutputBuf ready for caller
 end;
 
 end.

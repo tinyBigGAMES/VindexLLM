@@ -390,6 +390,7 @@ begin
         FEmbedDescSet, @LPush, SizeOf(LPush),
         (FHiddenDim div 2 + 255) div 256);
     end;
+    FCompute.BatchBarrier(); // ResidualGpu ready for first layer
   end;
 end;
 
@@ -413,9 +414,11 @@ begin
 
   // Copy residual to work buffer for in-place norming (GPU→GPU copy)
   FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
+  FCompute.BatchBarrier(); // WorkBufA ready for norm
 
   // PreAttnNorm in-place on work buffer
   FNorm.Apply(FWorkBufA, FNormWeights[ALayer].AttnNormGpu, FHiddenDim);
+  FCompute.BatchBarrier(); // WorkBufA normed, ready for attention matvecs
 
   // Per-layer RoPE theta: full layers use 1M, sliding layers use 10K
   if ALayer mod 6 = 5 then
@@ -437,6 +440,7 @@ begin
   // PostAttnNorm on attention output
   FNorm.Apply(FAttnOutBuf,
     FNormWeights[ALayer].PostAttnNormGpu, FHiddenDim);
+  FCompute.BatchBarrier(); // Normed AttnOutBuf ready for vec_add
 
   // GPU vec_add: residual += attn_output (no CPU round-trip)
   LVecAddPush.Count := FHiddenDim;
@@ -444,24 +448,28 @@ begin
     FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
     FVecAddAttnDescSet, @LVecAddPush, SizeOf(LVecAddPush),
     (FHiddenDim + 255) div 256);
+  FCompute.BatchBarrier(); // Residual updated, ready for FFN copy
 
   // === FFN branch: x = x + PostFFNNorm(FFN(PreFFNNorm(x))) ===
 
   // Copy residual to work buffer for in-place norming
   FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
+  FCompute.BatchBarrier(); // WorkBufA ready for FFN norm
 
   // PreFFNNorm in-place on work buffer
   FNorm.Apply(FWorkBufA, FNormWeights[ALayer].FFNNormGpu, FHiddenDim);
+  FCompute.BatchBarrier(); // WorkBufA normed, ready for gate/up matvecs
 
   // Dense FFN: gate(x), up(x), GELU(gate)*up, down(hidden)
 
-  // gate(x) → FGateBuf [FFNWidth]
+  // gate(x) → FGateBuf [FFNWidth] — reads WorkBufA, writes GateBuf
   FAttn.TestMatVec(FVindex.GetLayer(ALayer).GateGpuBuffer,
     FWorkBufA, FGateBuf, FHiddenDim, FFFNWidth, FWeightType);
 
-  // up(x) → FUpBuf [FFNWidth]
+  // up(x) → FUpBuf [FFNWidth] — reads WorkBufA, writes UpBuf (independent of gate)
   FAttn.TestMatVec(FUpWeights[ALayer],
     FWorkBufA, FUpBuf, FHiddenDim, FFFNWidth, FWeightType);
+  FCompute.BatchBarrier(); // GateBuf/UpBuf ready for GELU-mul
 
   // GELU(gate) * up → FGateBuf [FFNWidth] in-place
   LGeluPush.Count := FFFNWidth;
@@ -469,14 +477,17 @@ begin
     FGeluMulBundle.Pipeline, FGeluMulBundle.PipelineLayout,
     FGeluMulDescSet, @LGeluPush, SizeOf(LGeluPush),
     (FFFNWidth + 255) div 256);
+  FCompute.BatchBarrier(); // GateBuf (GELU result) ready for down matvec
 
   // down(hidden) → FFFNOutBuf [HiddenDim]
   FAttn.TestMatVec(FVindex.GetLayer(ALayer).DownGpuBuffer,
     FGateBuf, FFFNOutBuf, FFFNWidth, FHiddenDim, FWeightType);
+  FCompute.BatchBarrier(); // FFNOutBuf ready for post-norm
 
   // PostFFNNorm on FFN output
   FNorm.Apply(FFFNOutBuf,
     FNormWeights[ALayer].PostFFNNormGpu, FHiddenDim);
+  FCompute.BatchBarrier(); // Normed FFNOutBuf ready for vec_add
 
   // GPU vec_add: residual += ffn_output (no CPU round-trip)
   LVecAddPush.Count := FHiddenDim;
@@ -484,6 +495,7 @@ begin
     FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
     FVecAddFFNDescSet, @LVecAddPush, SizeOf(LVecAddPush),
     (FHiddenDim + 255) div 256);
+  FCompute.BatchBarrier(); // Residual ready for next layer
 end;
 
 // ============================================================================
@@ -506,7 +518,9 @@ begin
   FCompute.BeginBatch();
 
   FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
+  FCompute.BatchBarrier(); // WorkBufA ready for norm
   FNorm.Apply(FWorkBufA, FOutputNormGpu, FHiddenDim);
+  FCompute.BatchBarrier(); // WorkBufA normed, ready for unembedding matvec
   FAttn.TestMatVec(FEmbedGpu, FWorkBufA, FLogitsBuf,
     FHiddenDim, UInt32(FVocabSize), FEmbedType);
 
