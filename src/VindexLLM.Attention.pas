@@ -120,6 +120,15 @@ type
     NumHeads: UInt32;
   end;
 
+  { TVdxKVStoreBatchTQ3Push }
+  TVdxKVStoreBatchTQ3Push = record
+    HeadDim: UInt32;
+    MaxSeq: UInt32;
+    NumHeads: UInt32;
+    NumTokens: UInt32;
+    StartPos: UInt32;
+  end;
+
   { TVdxAttnScoresPrefillPush }
   TVdxAttnScoresPrefillPush = record
     HeadDim: UInt32;
@@ -238,6 +247,13 @@ type
     FTQ3KVDescPool: VkDescriptorPool;
     FTQ3KVQuantDescSet: VkDescriptorSet;          // for quantize dispatch
     FTQ3KVDequantDescSet: VkDescriptorSet;        // for dequantize dispatch
+
+    // Fused KV store + TQ3 quantize for batch prefill (Phase 3)
+    FKVStoreBatchTQ3Shader: VkShaderModule;
+    FKVStoreBatchTQ3Bundle: TVdxComputePipelineBundle;
+    FKVStoreBatchTQ3DescLayout: VkDescriptorSetLayout;  // 3 bindings: src, decode, TQ3
+    FKVStoreBatchTQ3DescPool: VkDescriptorPool;
+    FKVStoreBatchTQ3DescSet: VkDescriptorSet;
 
     // TQ3 compressed KV caches (per layer, replaces F32 caches)
     FKCacheTQ3: array of TVdxGpuBuffer;
@@ -415,6 +431,13 @@ begin
   FTQ3KVDequantBundle.PipelineLayout := VK_NULL_HANDLE;
   FTQ3KVDescLayout := VK_NULL_HANDLE;
   FTQ3KVDescPool := VK_NULL_HANDLE;
+
+  FKVStoreBatchTQ3Shader := VK_NULL_HANDLE;
+  FKVStoreBatchTQ3Bundle.Pipeline := VK_NULL_HANDLE;
+  FKVStoreBatchTQ3Bundle.PipelineLayout := VK_NULL_HANDLE;
+  FKVStoreBatchTQ3DescLayout := VK_NULL_HANDLE;
+  FKVStoreBatchTQ3DescPool := VK_NULL_HANDLE;
+  FKVStoreBatchTQ3DescSet := VK_NULL_HANDLE;
 end;
 
 destructor TVdxAttention.Destroy();
@@ -645,6 +668,17 @@ begin
   FTQ3KVDequantBundle := FCompute.CreateComputePipelineWithPush(
     FTQ3KVDequantShader, 'main', FTQ3KVDescLayout, SizeOf(TVdxTQ3KVDequantPush));
 
+  // Fused KV store + TQ3 quantize pipeline (Phase 3 — 3 bindings: src, decode, TQ3)
+  FKVStoreBatchTQ3Shader := LoadShader('KV_CACHE_STORE_BATCH_TQ3');
+  FKVStoreBatchTQ3DescLayout := FCompute.CreateStorageDescriptorSetLayout(3);
+  FKVStoreBatchTQ3Bundle := FCompute.CreateComputePipelineWithPush(
+    FKVStoreBatchTQ3Shader, 'main', FKVStoreBatchTQ3DescLayout,
+    SizeOf(TVdxKVStoreBatchTQ3Push));
+  FKVStoreBatchTQ3DescPool := FCompute.CreateDescriptorPoolForStorage(1, 3);
+  FKVStoreBatchTQ3DescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FKVStoreBatchTQ3DescPool, FKVStoreBatchTQ3DescLayout,
+    [LDummyBuf, LDummyBuf, LDummyBuf]);
+
   // TQ3 KV descriptor pool: 2 sets (quant + dequant), 2 bindings each = 4 total
   FTQ3KVDescPool := FCompute.CreateDescriptorPoolForStorage(2, 4);
   FTQ3KVQuantDescSet := FCompute.AllocateDescriptorSetForBuffers(
@@ -759,6 +793,15 @@ begin
   if FTQ3KVDequantShader <> VK_NULL_HANDLE then
     FCompute.DestroyShaderModuleHandle(FTQ3KVDequantShader);
 
+  // Destroy fused KV store + TQ3 quantize resources (Phase 3)
+  if FKVStoreBatchTQ3DescPool <> VK_NULL_HANDLE then
+    FCompute.DestroyDescriptorPoolHandle(FKVStoreBatchTQ3DescPool);
+  FCompute.DestroyComputePipelineBundle(FKVStoreBatchTQ3Bundle);
+  if FKVStoreBatchTQ3DescLayout <> VK_NULL_HANDLE then
+    FCompute.DestroyDescriptorSetLayoutHandle(FKVStoreBatchTQ3DescLayout);
+  if FKVStoreBatchTQ3Shader <> VK_NULL_HANDLE then
+    FCompute.DestroyShaderModuleHandle(FKVStoreBatchTQ3Shader);
+
   FCompute := nil;
 end;
 
@@ -872,12 +915,10 @@ procedure TVdxAttention.ForwardBatch(const AInputMat: TVdxGpuBuffer;
 var
   LQKNormPush: TVdxQKNormPush;
   LRoPEPush: TVdxRoPEBatchPush;
-  LKVStorePush: TVdxKVCacheStoreBatchPush;
+  LKVStoreTQ3Push: TVdxKVStoreBatchTQ3Push;
   LScoresPush: TVdxAttnScoresPrefillPush;
   LSoftmaxPush: TVdxSoftmaxPrefillPush;
   LValuePush: TVdxAttnValuePrefillPush;
-  LTQ3QuantPush: TVdxTQ3KVQuantPush;
-  LI: Integer;
 begin
   // ---- Step 1: Q/K/V projections (batch matmul) ----
   DispatchBatchMatMul(AWeights.QWeightGpu, AInputMat, AQMat,
@@ -931,48 +972,29 @@ begin
     FNumKVHeads, ANumTokens);
   FCompute.BatchBarrier(); // Q/K with RoPE applied
 
-  // ---- Step 4a: Store K and V into shared decode buffers (all positions at once) ----
-  LKVStorePush.HeadDim := FHeadDim;
-  LKVStorePush.MaxSeq := FMaxSeqLen;
-  LKVStorePush.NumKVHeads := FNumKVHeads;
-  LKVStorePush.NumTokens := ANumTokens;
-  LKVStorePush.StartPos := 0;
-  FCompute.UpdateDescriptorSetBuffers(FPrefillKVStoreDescSet,
-    [AKMat, AVMat, FKDecodeF32, FVDecodeF32]);
+  // ---- Step 4: Fused store + TQ3 quantize (writes decode buffer AND TQ3 cache) ----
+  LKVStoreTQ3Push.HeadDim := FHeadDim;
+  LKVStoreTQ3Push.MaxSeq := FMaxSeqLen;
+  LKVStoreTQ3Push.NumHeads := FNumKVHeads;
+  LKVStoreTQ3Push.NumTokens := ANumTokens;
+  LKVStoreTQ3Push.StartPos := 0;
+
+  // Fused K: projection → decode buffer + TQ3 cache
+  FCompute.UpdateDescriptorSetBuffers(FKVStoreBatchTQ3DescSet,
+    [AKMat, FKDecodeF32, FKCacheTQ3[ALayerIndex]]);
   FCompute.DispatchComputeWithPush(
-    FKVStoreBatchBundle.Pipeline, FKVStoreBatchBundle.PipelineLayout,
-    FPrefillKVStoreDescSet, @LKVStorePush, SizeOf(LKVStorePush),
-    FNumKVHeads, ANumTokens);
-  FCompute.BatchBarrier(); // Decode buffers filled with all positions
+    FKVStoreBatchTQ3Bundle.Pipeline, FKVStoreBatchTQ3Bundle.PipelineLayout,
+    FKVStoreBatchTQ3DescSet, @LKVStoreTQ3Push, SizeOf(LKVStoreTQ3Push),
+    (FHeadDim div 32) * FNumKVHeads, ANumTokens);
 
-  // ---- Step 4b: Quantize ALL positions from decode buffers → TQ3 cache ----
-  // One dispatch per position (each quantizes all heads for that position)
-  LTQ3QuantPush.BlocksPerHead := FHeadDim div 32;
-  LTQ3QuantPush.MaxSeq := FMaxSeqLen;
-  LTQ3QuantPush.NumHeads := FNumKVHeads;
-
-  for LI := 0 to Integer(ANumTokens) - 1 do
-  begin
-    LTQ3QuantPush.Position := UInt32(LI);
-
-    // Quantize K at position LI
-    FCompute.UpdateDescriptorSetBuffers(FTQ3KVQuantDescSet,
-      [FKDecodeF32, FKCacheTQ3[ALayerIndex]]);
-    FCompute.DispatchComputeWithPush(
-      FTQ3KVQuantBundle.Pipeline, FTQ3KVQuantBundle.PipelineLayout,
-      FTQ3KVQuantDescSet, @LTQ3QuantPush, SizeOf(LTQ3QuantPush),
-      (FHeadDim div 32) * FNumKVHeads);
-
-    // Quantize V at position LI
-    FCompute.UpdateDescriptorSetBuffers(FTQ3KVQuantDescSet,
-      [FVDecodeF32, FVCacheTQ3[ALayerIndex]]);
-    FCompute.DispatchComputeWithPush(
-      FTQ3KVQuantBundle.Pipeline, FTQ3KVQuantBundle.PipelineLayout,
-      FTQ3KVQuantDescSet, @LTQ3QuantPush, SizeOf(LTQ3QuantPush),
-      (FHeadDim div 32) * FNumKVHeads);
-  end;
-  FCompute.BatchBarrier(); // TQ3 cache populated for future generation tokens
-  // Note: No dequant needed — decode buffers already have all data from store step
+  // Fused V: projection → decode buffer + TQ3 cache
+  FCompute.UpdateDescriptorSetBuffers(FKVStoreBatchTQ3DescSet,
+    [AVMat, FVDecodeF32, FVCacheTQ3[ALayerIndex]]);
+  FCompute.DispatchComputeWithPush(
+    FKVStoreBatchTQ3Bundle.Pipeline, FKVStoreBatchTQ3Bundle.PipelineLayout,
+    FKVStoreBatchTQ3DescSet, @LKVStoreTQ3Push, SizeOf(LKVStoreTQ3Push),
+    (FHeadDim div 32) * FNumKVHeads, ANumTokens);
+  FCompute.BatchBarrier(); // Decode buffers + TQ3 caches ready
 
   // ---- Step 5: Prefill attention (scores + softmax + value) ----
 

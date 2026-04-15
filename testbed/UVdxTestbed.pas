@@ -69,8 +69,8 @@ begin
   LInference := TVdxInference.Create();
   try
     LInference.SetStatusCallback(StatusCallback, nil);
-    LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.f16.gguf');
-    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
+    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.f16.gguf');
+    LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
     LInference.SetTokenCallback(PrintToken, nil);
     //LInference.Generate(CPrompt);
     //LInference.Generate('how to make kno3?');

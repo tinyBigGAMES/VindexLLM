@@ -92,6 +92,9 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_dequantize.comp & exit /b 1 )
 %GLSLC% -V tq3_kv_quantize.comp -o tq3_kv_quantize.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_kv_quantize.comp & exit /b 1 )
 
+%GLSLC% -V kv_cache_store_batch_tq3.comp -o kv_cache_store_batch_tq3.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: kv_cache_store_batch_tq3.comp & exit /b 1 )
+
 %GLSLC% -V tq3_kv_dequantize.comp -o tq3_kv_dequantize.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_kv_dequantize.comp & exit /b 1 )
 

@@ -1,0 +1,157 @@
+#version 450
+
+// Fused KV Cache Store + TQ3 Quantize (Batch): reads projected K or V,
+// writes F32 to decode buffer AND TQ3 packed data to compressed cache
+// in a single pass. Replaces kv_cache_store_batch + tq3_kv_quantize_batch.
+//
+// Source layout:  [NumTokens × NumKVHeads × HeadDim], row-major (projection output)
+// Decode layout:  [NumKVHeads × MaxSeq × HeadDim], F32 (attention reads this)
+// TQ3 layout:     [NumKVHeads × MaxSeq × BlocksPerHead × 4], uint32 (persisted cache)
+//
+// Each workgroup (32 threads) processes one TQ3 block at one position for one head.
+// Dispatch 2D: (blocks_per_head * num_heads, num_tokens)
+//   X = head * blocks_per_head + block_in_head
+//   Y = token index (position = start_pos + Y)
+//
+// Bindings:
+//   0 = source projection matrix (readonly)
+//   1 = F32 decode buffer (writeonly)
+//   2 = TQ3 cache buffer (writeonly)
+//
+// Push constants:
+//   head_dim   = elements per head (256)
+//   max_seq    = max sequence length
+//   num_heads  = number of KV heads (4)
+//   num_tokens = tokens in batch
+//   start_pos  = cache position for first token (0 for prefill)
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint max_seq;
+    uint num_heads;
+    uint num_tokens;
+    uint start_pos;
+} pc;
+
+layout(std430, binding = 0) readonly buffer SrcProj {
+    float src_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer DecodeF32 {
+    float decode_data[];
+};
+
+layout(std430, binding = 2) writeonly buffer TQ3Cache {
+    uint tq3_data[];
+};
+
+shared float smem[32];
+shared uint pack[4];
+
+const int SIGNS[32] = int[32](
+    +1,-1,+1,+1,-1,+1,-1,-1, +1,+1,-1,+1,+1,-1,+1,-1,
+    -1,+1,+1,-1,+1,-1,+1,+1, -1,-1,+1,-1,+1,+1,-1,+1
+);
+
+const float BOUNDS[7] = float[7](
+    -1.7455, -1.0385, -0.4931, 0.0, 0.4931, 1.0385, 1.7455
+);
+
+const float WHT_NORM = 0.17677669529663688;
+const float CENTROID_MAX = 2.1573;
+
+void main() {
+    uint wg_x = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint j = gl_LocalInvocationID.x;
+
+    if (tok >= pc.num_tokens) return;
+
+    uint blocks_per_head = pc.head_dim / 32;
+    uint head = wg_x / blocks_per_head;
+    uint block_in_head = wg_x % blocks_per_head;
+
+    if (head >= pc.num_heads) return;
+
+    uint position = pc.start_pos + tok;
+
+    // --- Read from projection source ---
+    // Source: [tok × num_heads × head_dim + head × head_dim + block_in_head × 32 + j]
+    uint src_idx = (tok * pc.num_heads + head) * pc.head_dim + block_in_head * 32 + j;
+    float val = src_data[src_idx];
+
+    // --- Write to F32 decode buffer ---
+    // Decode: [head × max_seq × head_dim + position × head_dim + block_in_head × 32 + j]
+    uint dec_idx = (head * pc.max_seq + position) * pc.head_dim + block_in_head * 32 + j;
+    decode_data[dec_idx] = val;
+
+    // --- TQ3 quantize in-place ---
+
+    // 1. Apply sign flip
+    smem[j] = val * float(SIGNS[j]);
+    barrier();
+
+    // 2. WHT butterfly (5 stages for block size 32)
+    for (uint step = 1; step <= 16; step <<= 1) {
+        uint partner = j ^ step;
+        float a = smem[j];
+        float b = smem[partner];
+        barrier();
+        if ((j & step) == 0)
+            smem[j] = a + b;
+        else
+            smem[j] = b - a;
+        barrier();
+    }
+
+    // 3. Normalize
+    float xn = smem[j] * WHT_NORM;
+
+    // 4. Find block amax via parallel reduction
+    smem[j] = abs(xn);
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (j < s)
+            smem[j] = max(smem[j], smem[j + s]);
+        barrier();
+    }
+    float amax = smem[0];
+    float gamma = amax / CENTROID_MAX;
+    float inv_gamma = (gamma > 0.0) ? (1.0 / gamma) : 0.0;
+
+    // 5. Quantize to nearest centroid index (0-7)
+    float scaled = xn * inv_gamma;
+    uint idx;
+    if      (scaled < BOUNDS[0]) idx = 0;
+    else if (scaled < BOUNDS[1]) idx = 1;
+    else if (scaled < BOUNDS[2]) idx = 2;
+    else if (scaled < BOUNDS[3]) idx = 3;
+    else if (scaled < BOUNDS[4]) idx = 4;
+    else if (scaled < BOUNDS[5]) idx = 5;
+    else if (scaled < BOUNDS[6]) idx = 6;
+    else                          idx = 7;
+
+    // 6. Pack via shared atomic OR
+    if (j < 4) pack[j] = 0;
+    barrier();
+
+    uint qs_word = j / 16;
+    uint qs_shift = ((j / 4) % 4) * 8 + (j % 4) * 2;
+    atomicOr(pack[qs_word], (idx & 3u) << qs_shift);
+    atomicOr(pack[2], ((idx >> 2) & 1u) << j);
+    barrier();
+
+    if (j == 0) {
+        pack[3] = packHalf2x16(vec2(gamma, 0.0));
+    }
+    barrier();
+
+    // 7. Write packed block to TQ3 cache
+    // TQ3: [head × max_seq × blocks_per_head × 4 + position × blocks_per_head × 4 + block × 4 + j]
+    if (j < 4) {
+        uint tq3_base = (head * pc.max_seq + position) * blocks_per_head * 4;
+        tq3_data[tq3_base + block_in_head * 4 + j] = pack[j];
+    }
+}
