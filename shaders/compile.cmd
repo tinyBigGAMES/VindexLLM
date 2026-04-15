@@ -82,6 +82,13 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_batch_f16.comp & exit /b 1 )
 %GLSLC% -V embed_lookup_batch_q8.comp -o embed_lookup_batch_q8.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_batch_q8.comp & exit /b 1 )
 
+rem === TurboQuant (TQ3 KV cache compression) ===
+%GLSLC% -V tq3_quantize.comp -o tq3_quantize.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_quantize.comp & exit /b 1 )
+
+%GLSLC% -V tq3_dequantize.comp -o tq3_dequantize.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_dequantize.comp & exit /b 1 )
+
 rem === Activation and residual ===
 %GLSLC% -V gelu_mul.comp -o gelu_mul.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: gelu_mul.comp & exit /b 1 )

@@ -44,6 +44,10 @@ EMBED_LOOKUP_Q8         RCDATA "embed_lookup_q8.spv"
 EMBED_LOOKUP_BATCH_F16  RCDATA "embed_lookup_batch_f16.spv"
 EMBED_LOOKUP_BATCH_Q8   RCDATA "embed_lookup_batch_q8.spv"
 
+// TurboQuant (TQ3 KV cache compression)
+TQ3_QUANTIZE            RCDATA "tq3_quantize.spv"
+TQ3_DEQUANTIZE          RCDATA "tq3_dequantize.spv"
+
 // Activation and residual
 GELU_MUL                RCDATA "gelu_mul.spv"
 VEC_ADD                 RCDATA "vec_add.spv"

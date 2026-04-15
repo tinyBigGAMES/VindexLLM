@@ -1,7 +1,7 @@
-{===============================================================================
-  VindexLLM™ - Liberating LLM inference
+ï»¿{===============================================================================
+  VindexLLMï¿½ - Liberating LLM inference
 
-  Copyright © 2026-present tinyBigGAMES™ LLC
+  Copyright ï¿½ 2026-present tinyBigGAMESï¿½ LLC
   All Rights Reserved.
 
   https://vindexllm.com
@@ -23,6 +23,9 @@ uses
   System.IOUtils,
   System.Math,
   VindexLLM.Utils,
+  VindexLLM.Vulkan,
+  VindexLLM.Compute,
+  VindexLLM.TurboQuant,
   VindexLLM.Inference;
 
 procedure StatusCallback(const AText: string; const AUserData: Pointer);
@@ -78,15 +81,66 @@ begin
   end;
 end;
 
+procedure Test02();
+const
+  CNumBlocks = 256;   // 256 blocks x 32 = 8192 floats
+  CNumFloats = CNumBlocks * CTQ3BlockSize;
+var
+  LOriginal: array of Single;
+  LRestored: array of Single;
+  LBlock: TVdxTQ3Block;
+  LI: Integer;
+  LB: Integer;
+  LMSE: Double;
+  LMaxErr: Double;
+  LErr: Double;
+begin
+  TVdxUtils.PrintLn(COLOR_CYAN + '=== TurboQuant TQ3 Round-Trip Test (CPU) ===');
+
+  // Generate random data with realistic distribution
+  SetLength(LOriginal, CNumFloats);
+  SetLength(LRestored, CNumFloats);
+  RandSeed := 42;
+  for LI := 0 to CNumFloats - 1 do
+    LOriginal[LI] := (Random - 0.5) * 4.0;  // uniform [-2, +2]
+
+  // Round-trip: quantize then dequantize each block
+  for LB := 0 to CNumBlocks - 1 do
+  begin
+    TVdxTurboQuant.QuantizeBlockCPU(@LOriginal[LB * CTQ3BlockSize], LBlock);
+    TVdxTurboQuant.DequantizeBlockCPU(LBlock, @LRestored[LB * CTQ3BlockSize]);
+  end;
+
+  // Compute MSE and max error
+  LMSE := TVdxTurboQuant.ComputeMSE(@LOriginal[0], @LRestored[0], CNumFloats);
+  LMaxErr := 0.0;
+  for LI := 0 to CNumFloats - 1 do
+  begin
+    LErr := Abs(LOriginal[LI] - LRestored[LI]);
+    if LErr > LMaxErr then
+      LMaxErr := LErr;
+  end;
+
+  TVdxUtils.PrintLn('  Blocks:    %d (%d floats)', [CNumBlocks, CNumFloats]);
+  TVdxUtils.PrintLn('  MSE:       %.6f (target ~0.034)', [LMSE]);
+  TVdxUtils.PrintLn('  Max error: %.6f', [LMaxErr]);
+
+  if LMSE < 0.1 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  PASS: MSE within expected range')
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  FAIL: MSE too high');
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
 begin
   try
-    LIndex := 1;
+    LIndex := 2;
 
     case LIndex of
       1: Test01();
+      2: Test02();
     end;
   except
     on E: Exception do

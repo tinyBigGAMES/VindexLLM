@@ -20,6 +20,7 @@ uses
   UVdxTestbed in 'UVdxTestbed.pas',
   VindexLLM.Attention in '..\src\VindexLLM.Attention.pas',
   VindexLLM.ChatTemplate in '..\src\VindexLLM.ChatTemplate.pas',
+  VindexLLM.Compute in '..\src\VindexLLM.Compute.pas',
   VindexLLM.Config in '..\src\VindexLLM.Config.pas',
   VindexLLM.FFNWeights in '..\src\VindexLLM.FFNWeights.pas',
   VindexLLM.GGUFReader in '..\src\VindexLLM.GGUFReader.pas',
@@ -29,9 +30,9 @@ uses
   VindexLLM.Shaders in '..\src\VindexLLM.Shaders.pas',
   VindexLLM.Tokenizer in '..\src\VindexLLM.Tokenizer.pas',
   VindexLLM.TOML in '..\src\VindexLLM.TOML.pas',
+  VindexLLM.TurboQuant in '..\src\VindexLLM.TurboQuant.pas',
   VindexLLM.Utils in '..\src\VindexLLM.Utils.pas',
   VindexLLM.VirtualBuffer in '..\src\VindexLLM.VirtualBuffer.pas',
-  VindexLLM.Compute in '..\src\VindexLLM.Compute.pas',
   VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas';
 
 begin

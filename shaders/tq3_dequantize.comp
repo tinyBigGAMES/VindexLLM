@@ -1,0 +1,89 @@
+#version 450
+
+// TQ3 Dequantize: decompress a 16-byte TQ3 block back to 32 F32 values.
+//
+// Algorithm: unpack indices -> centroid lookup -> scale -> WHT butterfly -> normalize -> undo signs
+//
+// One workgroup = one block of 32 elements. local_size_x = 32.
+//
+// Input layout per block (4 x uint32 = 16 bytes):
+//   Word 0: qs[0..3] — elements 0-15, low 2 index bits
+//   Word 1: qs[4..7] — elements 16-31, low 2 index bits
+//   Word 2: qr[0..3] — elements 0-31, high 1 index bit
+//   Word 3: gamma as FP16 in low 16 bits
+//
+// Bindings:
+//   0 = input TQ3 buffer (readonly, num_blocks * 4 uint32s)
+//   1 = output F32 buffer (writeonly, num_blocks * 32 floats)
+//
+// Push constants:
+//   num_blocks = total blocks to process
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+} pc;
+layout(std430, binding = 0) readonly buffer InputBuf {
+    uint input_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuf {
+    float output_data[];
+};
+
+shared float smem[32];
+
+// Same sign pattern as quantize (must match exactly)
+const int SIGNS[32] = int[32](
+    +1,-1,+1,+1,-1,+1,-1,-1, +1,+1,-1,+1,+1,-1,+1,-1,
+    -1,+1,+1,-1,+1,-1,+1,+1, -1,-1,+1,-1,+1,+1,-1,+1
+);
+
+// Lloyd-Max 3-bit centroids
+const float CENTROIDS[8] = float[8](
+    -2.1573, -1.3336, -0.7434, -0.2428,
+    +0.2428, +0.7434, +1.3336, +2.1573
+);
+
+const float WHT_NORM = 0.17677669529663688;  // 1/sqrt(32)
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+
+    if (bid >= pc.num_blocks) return;
+
+    // 1. Read packed block words
+    uint qs_word = input_data[bid * 4 + (j / 16)];       // word 0 or 1
+    uint qr_word = input_data[bid * 4 + 2];               // word 2
+    uint gamma_packed = input_data[bid * 4 + 3];           // word 3
+
+    // 2. Unpack 3-bit index for element j
+    uint qs_shift = ((j / 4) % 4) * 8 + (j % 4) * 2;
+    uint low2 = (qs_word >> qs_shift) & 3u;
+    uint high1 = (qr_word >> j) & 1u;
+    uint idx = low2 | (high1 << 2);
+
+    // 3. Centroid lookup and scale
+    float gamma = unpackHalf2x16(gamma_packed).x;
+    smem[j] = CENTROIDS[idx] * gamma;
+    barrier();
+    // 4. Inverse WHT butterfly (same as forward — self-inverse)
+    for (uint step = 1; step <= 16; step <<= 1) {
+        uint partner = j ^ step;
+        float a = smem[j];
+        float b = smem[partner];
+        barrier();
+        if ((j & step) == 0)
+            smem[j] = a + b;
+        else
+            smem[j] = b - a;
+        barrier();
+    }
+
+    // 5. Normalize by 1/sqrt(32) and undo sign flip
+    float result = smem[j] * WHT_NORM * float(SIGNS[j]);
+
+    // 6. Write output
+    output_data[bid * 32 + j] = result;
+}

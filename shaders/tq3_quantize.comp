@@ -1,0 +1,125 @@
+#version 450
+
+// TQ3 Quantize: compress 32 F32 values into a 16-byte TQ3 block.
+//
+// Algorithm: sign flips -> WHT butterfly -> normalize -> scale -> codebook -> pack
+//
+// One workgroup = one block of 32 floats. local_size_x = 32.
+//
+// Output layout per block (4 x uint32 = 16 bytes):
+//   Word 0: qs[0..3] — elements 0-15, low 2 index bits (4 per byte)
+//   Word 1: qs[4..7] — elements 16-31, low 2 index bits
+//   Word 2: qr[0..3] — elements 0-31, high 1 index bit (8 per byte)
+//   Word 3: gamma as FP16 in low 16 bits (upper 16 = 0)
+//
+// Bindings:
+//   0 = input F32 buffer (readonly, num_blocks * 32 floats)
+//   1 = output TQ3 buffer (writeonly, num_blocks * 4 uint32s)
+//
+// Push constants:
+//   num_blocks = total blocks to process
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+} pc;
+layout(std430, binding = 0) readonly buffer InputBuf {
+    float input_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuf {
+    uint output_data[];
+};
+
+// Shared memory for WHT butterfly and max reduction
+shared float smem[32];
+// Shared memory for bit packing (4 words per block)
+shared uint pack[4];
+
+// Fixed sign flip pattern
+const int SIGNS[32] = int[32](
+    +1,-1,+1,+1,-1,+1,-1,-1, +1,+1,-1,+1,+1,-1,+1,-1,
+    -1,+1,+1,-1,+1,-1,+1,+1, -1,-1,+1,-1,+1,+1,-1,+1
+);
+
+// Lloyd-Max 3-bit decision boundaries
+const float BOUNDS[7] = float[7](
+    -1.7455, -1.0385, -0.4931, 0.0, 0.4931, 1.0385, 1.7455
+);
+
+const float WHT_NORM = 0.17677669529663688;  // 1/sqrt(32)
+const float CENTROID_MAX = 2.1573;
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+
+    if (bid >= pc.num_blocks) return;
+
+    // 1. Load and apply sign flip
+    smem[j] = input_data[bid * 32 + j] * float(SIGNS[j]);
+    barrier();
+
+    // 2. WHT butterfly (5 stages for block size 32)
+    for (uint step = 1; step <= 16; step <<= 1) {
+        uint partner = j ^ step;
+        float a = smem[j];
+        float b = smem[partner];
+        barrier();
+        if ((j & step) == 0)
+            smem[j] = a + b;
+        else
+            smem[j] = b - a;
+        barrier();
+    }
+    // 3. Normalize by 1/sqrt(32) and save the transformed value
+    float xn = smem[j] * WHT_NORM;
+
+    // 4. Find block amax via parallel reduction
+    smem[j] = abs(xn);
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (j < s)
+            smem[j] = max(smem[j], smem[j + s]);
+        barrier();
+    }
+    float amax = smem[0];
+    float gamma = amax / CENTROID_MAX;
+    float inv_gamma = (gamma > 0.0) ? (1.0 / gamma) : 0.0;
+
+    // 5. Quantize to nearest centroid index (0-7)
+    float scaled = xn * inv_gamma;
+    uint idx;
+    if      (scaled < BOUNDS[0]) idx = 0;
+    else if (scaled < BOUNDS[1]) idx = 1;
+    else if (scaled < BOUNDS[2]) idx = 2;
+    else if (scaled < BOUNDS[3]) idx = 3;
+    else if (scaled < BOUNDS[4]) idx = 4;
+    else if (scaled < BOUNDS[5]) idx = 5;
+    else if (scaled < BOUNDS[6]) idx = 6;
+    else                          idx = 7;
+    // 6. Pack 3-bit indices into output block via shared atomic OR
+    if (j < 4) pack[j] = 0;
+    barrier();
+
+    // Low 2 bits → qs words (pack[0] for j=0..15, pack[1] for j=16..31)
+    uint qs_word = j / 16;
+    uint qs_shift = ((j / 4) % 4) * 8 + (j % 4) * 2;
+    atomicOr(pack[qs_word], (idx & 3u) << qs_shift);
+
+    // High 1 bit → qr word (pack[2], one bit per element)
+    atomicOr(pack[2], ((idx >> 2) & 1u) << j);
+
+    barrier();
+
+    // 7. Thread 0 writes gamma and stores the block
+    if (j == 0) {
+        pack[3] = packHalf2x16(vec2(gamma, 0.0));
+    }
+    barrier();
+
+    // 8. Write packed block to output (4 uint32 per block)
+    if (j < 4) {
+        output_data[bid * 4 + j] = pack[j];
+    }
+}
