@@ -89,6 +89,12 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_quantize.comp & exit /b 1 )
 %GLSLC% -V tq3_dequantize.comp -o tq3_dequantize.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_dequantize.comp & exit /b 1 )
 
+%GLSLC% -V tq3_kv_quantize.comp -o tq3_kv_quantize.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_kv_quantize.comp & exit /b 1 )
+
+%GLSLC% -V tq3_kv_dequantize.comp -o tq3_kv_dequantize.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_kv_dequantize.comp & exit /b 1 )
+
 rem === Activation and residual ===
 %GLSLC% -V gelu_mul.comp -o gelu_mul.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: gelu_mul.comp & exit /b 1 )

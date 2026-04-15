@@ -1,0 +1,105 @@
+#version 450
+
+// TQ3 KV Cache Dequantize: decompress all positions (0..seq_len-1) for all heads
+// from TQ3 packed cache back to F32 decode buffer.
+//
+// Cache layout (TQ3): [head][position][block] — blocks_per_head × 4 uint32 per head/pos
+// Cache layout (F32): [head][position][dim]   — HeadDim contiguous floats per head/pos
+//
+// Each workgroup processes one TQ3 block (32 elements).
+// Dispatch: blocks_per_head * num_heads * seq_len workgroups
+//
+// Bindings:
+//   0 = TQ3 cache buffer  (readonly)  [num_heads * max_seq * blocks_per_head * 4]
+//   1 = F32 decode buffer (writeonly) [num_heads * max_seq * head_dim]
+//
+// Push constants:
+//   blocks_per_head = head_dim / 32 (= 8 for Gemma 3)
+//   max_seq         = maximum sequence length
+//   seq_len         = current sequence length (positions to dequantize)
+//   num_heads       = number of KV heads
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint blocks_per_head;
+    uint max_seq;
+    uint seq_len;
+    uint num_heads;
+} pc;
+
+layout(std430, binding = 0) readonly buffer TQ3Cache {
+    uint tq3_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer F32Cache {
+    float f32_data[];
+};
+
+shared float smem[32];
+
+const int SIGNS[32] = int[32](
+    +1,-1,+1,+1,-1,+1,-1,-1, +1,+1,-1,+1,+1,-1,+1,-1,
+    -1,+1,+1,-1,+1,-1,+1,+1, -1,-1,+1,-1,+1,+1,-1,+1
+);
+
+const float CENTROIDS[8] = float[8](
+    -2.1573, -1.3336, -0.7434, -0.2428,
+    +0.2428, +0.7434, +1.3336, +2.1573
+);
+
+const float WHT_NORM = 0.17677669529663688;
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+
+    // Decompose workgroup ID into (position, head, block_in_head)
+    uint blocks_per_pos = pc.blocks_per_head * pc.num_heads;
+    uint pos = wg / blocks_per_pos;
+    uint remainder = wg % blocks_per_pos;
+    uint head = remainder / pc.blocks_per_head;
+    uint block_in_head = remainder % pc.blocks_per_head;
+
+    if (pos >= pc.seq_len || head >= pc.num_heads) return;
+
+    // TQ3 source offset: [head][position][block] layout, 4 uint32 per block
+    uint tq3_base = (head * pc.max_seq + pos) * pc.blocks_per_head * 4;
+    uint block_offset = tq3_base + block_in_head * 4;
+
+    // 1. Read packed block words
+    uint qs_word = tq3_data[block_offset + (j / 16)];
+    uint qr_word = tq3_data[block_offset + 2];
+    uint gamma_packed = tq3_data[block_offset + 3];
+
+    // 2. Unpack 3-bit index for element j
+    uint qs_shift = ((j / 4) % 4) * 8 + (j % 4) * 2;
+    uint low2 = (qs_word >> qs_shift) & 3u;
+    uint high1 = (qr_word >> j) & 1u;
+    uint idx = low2 | (high1 << 2);
+
+    // 3. Centroid lookup and scale
+    float gamma = unpackHalf2x16(gamma_packed).x;
+    smem[j] = CENTROIDS[idx] * gamma;
+    barrier();
+
+    // 4. Inverse WHT butterfly (same as forward — self-inverse)
+    for (uint step = 1; step <= 16; step <<= 1) {
+        uint partner = j ^ step;
+        float a = smem[j];
+        float b = smem[partner];
+        barrier();
+        if ((j & step) == 0)
+            smem[j] = a + b;
+        else
+            smem[j] = b - a;
+        barrier();
+    }
+
+    // 5. Normalize and undo sign flip
+    float result = smem[j] * WHT_NORM * float(SIGNS[j]);
+
+    // 6. Write to F32 decode buffer: [head][position][dim] layout
+    uint f32_base = (head * pc.max_seq + pos) * (pc.blocks_per_head * 32);
+    f32_data[f32_base + block_in_head * 32 + j] = result;
+}

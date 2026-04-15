@@ -113,6 +113,10 @@ type
       const AInput: TVdxTQ3Block;
       const AOutput: PSingle); static;
 
+    // Descriptor set layouts (needed for external pool/set allocation)
+    property QuantDescLayout: VkDescriptorSetLayout read FQuantDescLayout;
+    property DequantDescLayout: VkDescriptorSetLayout read FDequantDescLayout;
+
     // Utility: compute MSE between two float arrays
     class function ComputeMSE(
       const AA: PSingle;
