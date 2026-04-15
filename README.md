@@ -1,2 +1,2 @@
 # VindexLLM
-Graph-Walk LLM Inference Engine
+Liberating LLM inference
