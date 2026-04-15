@@ -55,6 +55,17 @@ type
     GqaRatio: UInt32;
   end;
 
+  { TVdxAttnScoresMHTQ3Push }
+  TVdxAttnScoresMHTQ3Push = record
+    HeadDim: UInt32;
+    SeqLen: UInt32;
+    MaxSeq: UInt32;
+    Scale: Single;
+    NumQHeads: UInt32;
+    GqaRatio: UInt32;
+    BlocksPerHead: UInt32;
+  end;
+
   { TVdxSoftmaxMHPush }
   TVdxSoftmaxMHPush = record
     SeqLen: UInt32;
@@ -255,6 +266,10 @@ type
     FKVStoreBatchTQ3DescPool: VkDescriptorPool;
     FKVStoreBatchTQ3DescSet: VkDescriptorSet;
 
+    // Fused attention scores on TQ3 keys (Phase 4 — eliminates K dequant)
+    FAttnScoresMHTQ3Shader: VkShaderModule;
+    FAttnScoresMHTQ3Bundle: TVdxComputePipelineBundle;
+
     // TQ3 compressed KV caches (per layer, replaces F32 caches)
     FKCacheTQ3: array of TVdxGpuBuffer;
     FVCacheTQ3: array of TVdxGpuBuffer;
@@ -438,6 +453,10 @@ begin
   FKVStoreBatchTQ3DescLayout := VK_NULL_HANDLE;
   FKVStoreBatchTQ3DescPool := VK_NULL_HANDLE;
   FKVStoreBatchTQ3DescSet := VK_NULL_HANDLE;
+
+  FAttnScoresMHTQ3Shader := VK_NULL_HANDLE;
+  FAttnScoresMHTQ3Bundle.Pipeline := VK_NULL_HANDLE;
+  FAttnScoresMHTQ3Bundle.PipelineLayout := VK_NULL_HANDLE;
 end;
 
 destructor TVdxAttention.Destroy();
@@ -685,6 +704,13 @@ begin
     FTQ3KVDescPool, FTQ3KVDescLayout, [LDummyBuf, LDummyBuf]);
   FTQ3KVDequantDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FTQ3KVDescPool, FTQ3KVDescLayout, [LDummyBuf, LDummyBuf]);
+
+  // --- Fused TQ3 attention scores pipeline (Phase 4) ---
+  // Reuses FAttnScoresDescLayout (3 bindings) and FScoresDescSet
+  FAttnScoresMHTQ3Shader := LoadShader('ATTN_SCORES_MH_TQ3');
+  FAttnScoresMHTQ3Bundle := FCompute.CreateComputePipelineWithPush(
+    FAttnScoresMHTQ3Shader, 'main', FAttnScoresDescLayout,
+    SizeOf(TVdxAttnScoresMHTQ3Push));
 end;
 
 procedure TVdxAttention.Cleanup();
@@ -801,6 +827,11 @@ begin
     FCompute.DestroyDescriptorSetLayoutHandle(FKVStoreBatchTQ3DescLayout);
   if FKVStoreBatchTQ3Shader <> VK_NULL_HANDLE then
     FCompute.DestroyShaderModuleHandle(FKVStoreBatchTQ3Shader);
+
+  // Destroy fused TQ3 attention scores resources (Phase 4)
+  FCompute.DestroyComputePipelineBundle(FAttnScoresMHTQ3Bundle);
+  if FAttnScoresMHTQ3Shader <> VK_NULL_HANDLE then
+    FCompute.DestroyShaderModuleHandle(FAttnScoresMHTQ3Shader);
 
   FCompute := nil;
 end;
@@ -1141,12 +1172,12 @@ var
   LSeqLen: UInt32;
   LQKNormPush: TVdxQKNormPush;
   LRoPEPush: TVdxRoPEPush;
-  LScoresMHPush: TVdxAttnScoresMHPush;
   LSoftmaxMHPush: TVdxSoftmaxMHPush;
   LValueMHPush: TVdxAttnValueMHPush;
   LKVStorePush: TVdxKVCacheStorePush;
   LTQ3QuantPush: TVdxTQ3KVQuantPush;
   LTQ3DequantPush: TVdxTQ3KVDequantPush;
+  LScoresMHTQ3Push: TVdxAttnScoresMHTQ3Push;
 begin
   LSeqLen := UInt32(APosition) + 1;
 
@@ -1233,44 +1264,39 @@ begin
     (FHeadDim div 32) * FNumKVHeads);
   FCompute.BatchBarrier(); // TQ3 cache updated with new position
 
-  // ---- Step 4c: Dequantize ALL positions from TQ3 cache → decode buffers ----
+  // ---- Step 4c: Dequantize V positions from TQ3 cache → V decode buffer ----
+  // K dequant eliminated by Phase 4 fused attention (reads TQ3 K directly)
   LTQ3DequantPush.BlocksPerHead := FHeadDim div 32;
   LTQ3DequantPush.MaxSeq := FMaxSeqLen;
   LTQ3DequantPush.SeqLen := LSeqLen;
   LTQ3DequantPush.NumHeads := FNumKVHeads;
 
-  // Dequantize K
-  FCompute.UpdateDescriptorSetBuffers(FTQ3KVDequantDescSet,
-    [FKCacheTQ3[ALayerIndex], FKDecodeF32]);
-  FCompute.DispatchComputeWithPush(
-    FTQ3KVDequantBundle.Pipeline, FTQ3KVDequantBundle.PipelineLayout,
-    FTQ3KVDequantDescSet, @LTQ3DequantPush, SizeOf(LTQ3DequantPush),
-    (FHeadDim div 32) * FNumKVHeads * LSeqLen);
-
-  // Dequantize V
+  // Dequantize V only (K is read directly from TQ3 cache by fused attention)
   FCompute.UpdateDescriptorSetBuffers(FTQ3KVDequantDescSet,
     [FVCacheTQ3[ALayerIndex], FVDecodeF32]);
   FCompute.DispatchComputeWithPush(
     FTQ3KVDequantBundle.Pipeline, FTQ3KVDequantBundle.PipelineLayout,
     FTQ3KVDequantDescSet, @LTQ3DequantPush, SizeOf(LTQ3DequantPush),
     (FHeadDim div 32) * FNumKVHeads * LSeqLen);
-  FCompute.BatchBarrier(); // Decode buffers have all positions dequantized
+  FCompute.BatchBarrier(); // V decode buffer has all positions dequantized
 
-  // ---- Step 5: Multi-head attention (reads from decode buffers) ----
+  // ---- Step 5: Multi-head attention ----
 
-  // 5a. All heads' scores in one 2D dispatch
-  LScoresMHPush.HeadDim := FHeadDim;
-  LScoresMHPush.SeqLen := LSeqLen;
-  LScoresMHPush.MaxSeq := FMaxSeqLen;
-  LScoresMHPush.Scale := 1.0 / Sqrt(Single(FHeadDim));
-  LScoresMHPush.NumQHeads := FNumQHeads;
-  LScoresMHPush.GqaRatio := FNumQHeads div FNumKVHeads;
+  // 5a. Fused TQ3 attention scores — reads Q + TQ3 K cache directly
+  //     Applies WHT to Q on the fly, dots against packed TQ3 centroids
+  LScoresMHTQ3Push.HeadDim := FHeadDim;
+  LScoresMHTQ3Push.SeqLen := LSeqLen;
+  LScoresMHTQ3Push.MaxSeq := FMaxSeqLen;
+  LScoresMHTQ3Push.Scale := 1.0 / Sqrt(Single(FHeadDim));
+  LScoresMHTQ3Push.NumQHeads := FNumQHeads;
+  LScoresMHTQ3Push.GqaRatio := FNumQHeads div FNumKVHeads;
+  LScoresMHTQ3Push.BlocksPerHead := FHeadDim div 32;
 
   FCompute.UpdateDescriptorSetBuffers(FScoresDescSet,
-    [FQBuf, FKDecodeF32, FScoresBuf]);
+    [FQBuf, FKCacheTQ3[ALayerIndex], FScoresBuf]);
   FCompute.DispatchComputeWithPush(
-    FAttnScoresMHBundle.Pipeline, FAttnScoresMHBundle.PipelineLayout,
-    FScoresDescSet, @LScoresMHPush, SizeOf(LScoresMHPush),
+    FAttnScoresMHTQ3Bundle.Pipeline, FAttnScoresMHTQ3Bundle.PipelineLayout,
+    FScoresDescSet, @LScoresMHTQ3Push, SizeOf(LScoresMHTQ3Push),
     (LSeqLen + 255) div 256, FNumQHeads);
   FCompute.BatchBarrier(); // ScoresBuf ready for softmax
 

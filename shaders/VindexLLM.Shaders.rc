@@ -50,6 +50,7 @@ TQ3_DEQUANTIZE          RCDATA "tq3_dequantize.spv"
 TQ3_KV_QUANTIZE             RCDATA "tq3_kv_quantize.spv"
 KV_CACHE_STORE_BATCH_TQ3    RCDATA "kv_cache_store_batch_tq3.spv"
 TQ3_KV_DEQUANTIZE           RCDATA "tq3_kv_dequantize.spv"
+ATTN_SCORES_MH_TQ3          RCDATA "attn_scores_mh_tq3.spv"
 
 // Activation and residual
 GELU_MUL                RCDATA "gelu_mul.spv"

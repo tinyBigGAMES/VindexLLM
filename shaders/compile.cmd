@@ -98,6 +98,9 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: kv_cache_store_batch_tq3.comp & exit /b 1 )
 %GLSLC% -V tq3_kv_dequantize.comp -o tq3_kv_dequantize.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: tq3_kv_dequantize.comp & exit /b 1 )
 
+%GLSLC% -V attn_scores_mh_tq3.comp -o attn_scores_mh_tq3.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: attn_scores_mh_tq3.comp & exit /b 1 )
+
 rem === Activation and residual ===
 %GLSLC% -V gelu_mul.comp -o gelu_mul.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: gelu_mul.comp & exit /b 1 )

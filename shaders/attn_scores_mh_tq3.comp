@@ -1,0 +1,131 @@
+#version 450
+
+// Fused Multi-Head Attention Scores on TQ3-compressed Keys (Phase 4)
+//
+// Computes scaled dot products directly against TQ3-packed K cache,
+// eliminating the K dequant pass entirely. Exploits WHT orthogonality:
+//   dot(q, k) = dot(WHT_NORM * WHT(signs*q), WHT_NORM * WHT(signs*k))
+//
+// K was stored as quantized(WHT_NORM * WHT(signs * k)) during tq3_kv_quantize.
+// This shader applies sign flip + WHT to Q on the fly, then dots against
+// partially-dequantized K (centroids * gamma, no inverse WHT).
+//
+// Result is multiplied by WHT_NORM (one-sided normalization for Q) and scale.
+//
+// Dispatch: (ceil(seq_len / 256), num_q_heads, 1)
+//
+// Bindings:
+//   0 = q_buf     (float[], all Q heads concatenated, post-RoPE)
+//   1 = k_tq3     (uint[],  TQ3 compressed K cache [head][pos][block]*4)
+//   2 = scores    (float[], num_q_heads x max_seq, output)
+//
+// Push constants:
+//   head_dim        = dimension per head (256)
+//   seq_len         = number of positions in KV cache (including current)
+//   max_seq         = max sequence length (stride in scores + TQ3 cache)
+//   scale           = 1.0 / sqrt(head_dim)
+//   num_q_heads     = number of query heads (8)
+//   gqa_ratio       = num_q_heads / num_kv_heads (2 for Gemma 3)
+//   blocks_per_head = head_dim / 32 (8 for Gemma 3)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  seq_len;
+    uint  max_seq;
+    float scale;
+    uint  num_q_heads;
+    uint  gqa_ratio;
+    uint  blocks_per_head;
+} pc;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+    float q_buf[];
+};
+
+layout(std430, binding = 1) readonly buffer KCacheTQ3 {
+    uint k_tq3[];
+};
+
+layout(std430, binding = 2) writeonly buffer ScoresBuf {
+    float scores[];
+};
+
+const int SIGNS[32] = int[32](
+    +1,-1,+1,+1,-1,+1,-1,-1, +1,+1,-1,+1,+1,-1,+1,-1,
+    -1,+1,+1,-1,+1,-1,+1,+1, -1,-1,+1,-1,+1,+1,-1,+1
+);
+
+const float CENTROIDS[8] = float[8](
+    -2.1573, -1.3336, -0.7434, -0.2428,
+     0.2428,  0.7434,  1.3336,  2.1573
+);
+
+const float WHT_NORM = 0.17677669529663688;
+
+void main() {
+    uint pos = gl_GlobalInvocationID.x;
+    uint q_head = gl_WorkGroupID.y;
+
+    if (pos >= pc.seq_len || q_head >= pc.num_q_heads)
+        return;
+
+    uint kv_head = q_head / pc.gqa_ratio;
+    uint q_off = q_head * pc.head_dim;
+
+    // TQ3 cache offset: [head][position][block] layout, 4 uint32 per block
+    uint tq3_base = (kv_head * pc.max_seq + pos) * pc.blocks_per_head * 4;
+
+    float acc = 0.0;
+
+    // Process 8 blocks of 32 elements each
+    for (uint blk = 0; blk < pc.blocks_per_head; blk++) {
+
+        // 1. Load Q block and apply sign flips (must match quantize transform)
+        float q[32];
+        for (uint j = 0; j < 32; j++) {
+            q[j] = q_buf[q_off + blk * 32 + j] * float(SIGNS[j]);
+        }
+
+        // 2. WHT butterfly on Q (5 stages for block size 32, in-register)
+        //    Standard butterfly: a' = a + b, b' = a - b
+        //    Must match tq3_kv_quantize.comp exactly
+        for (uint step = 1; step <= 16; step <<= 1) {
+            for (uint j = 0; j < 32; j += step * 2) {
+                for (uint k = j; k < j + step; k++) {
+                    float a = q[k];
+                    float b = q[k + step];
+                    q[k]        = a + b;
+                    q[k + step] = a - b;
+                }
+            }
+        }
+
+        // 3. Unpack TQ3 K block and dot against WHT'd Q
+        uint tq3_off = tq3_base + blk * 4;
+        uint qs0   = k_tq3[tq3_off + 0];  // 2-bit low indices for j=0..15
+        uint qs1   = k_tq3[tq3_off + 1];  // 2-bit low indices for j=16..31
+        uint qr    = k_tq3[tq3_off + 2];  // 1-bit high indices for j=0..31
+        float gamma = unpackHalf2x16(k_tq3[tq3_off + 3]).x;
+
+        float blk_acc = 0.0;
+        for (uint j = 0; j < 32; j++) {
+            // Extract 3-bit centroid index: 2 low bits from qs, 1 high bit from qr
+            uint qs_word = (j < 16) ? qs0 : qs1;
+            uint qs_shift = ((j / 4) % 4) * 8 + (j % 4) * 2;
+            uint lo = (qs_word >> qs_shift) & 3u;
+            uint hi = (qr >> j) & 1u;
+            uint idx = lo | (hi << 2);
+
+            // Centroid * gamma = partial dequant (stays in rotated space)
+            blk_acc += q[j] * CENTROIDS[idx] * gamma;
+        }
+
+        acc += blk_acc;
+    }
+
+    // WHT_NORM for Q side (K was already normalized during quantize)
+    // CRITICAL: This is 1/sqrt(32), NOT 1/32 — getting this wrong produces garbage
+    scores[q_head * pc.max_seq + pos] = acc * WHT_NORM * pc.scale;
+}
