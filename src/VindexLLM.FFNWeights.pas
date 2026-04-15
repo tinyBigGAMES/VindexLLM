@@ -1,5 +1,5 @@
 ﻿{===============================================================================
-  VindexLLM™ - Graph-Walk LLM Inference Engine
+  VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
@@ -9,7 +9,7 @@
   See LICENSE for license information
 ===============================================================================}
 
-unit VindexLLM.Vindex;
+unit VindexLLM.FFNWeights;
 
 {$I VindexLLM.Defines.inc}
 
@@ -21,7 +21,8 @@ uses
   System.Generics.Collections,
   VindexLLM.Utils,
   VindexLLM.GGUFReader,
-  VindexLLM.VulkanCompute;
+  VindexLLM.Vulkan,
+  VindexLLM.Compute;
 
 type
 
@@ -43,8 +44,8 @@ type
     DownGpuBuffer: TVdxGpuBuffer;
   end;
 
-  { TVdxVindex }
-  TVdxVindex = class(TVdxBaseObject)
+  { TVdxFFNWeights }
+  TVdxFFNWeights = class(TVdxBaseObject)
   private
     FLayers: TArray<TVdxFFNLayerView>;
     FLayerCount: Integer;
@@ -79,11 +80,9 @@ type
 
 implementation
 
-// ============================================================================
-//  TVdxVindex — Construction / Destruction
-// ============================================================================
+{ TVdxFFNWeights }
 
-constructor TVdxVindex.Create();
+constructor TVdxFFNWeights.Create();
 begin
   inherited;
 
@@ -93,17 +92,13 @@ begin
   FFFNWidth := 0;
 end;
 
-destructor TVdxVindex.Destroy();
+destructor TVdxFFNWeights.Destroy();
 begin
   FLayers := nil;
   inherited;
 end;
 
-// ============================================================================
-//  BuildFromGGUF — Scan tensors, build layer-indexed view
-// ============================================================================
-
-function TVdxVindex.BuildFromGGUF(const AReader: TVdxGGUFReader): Boolean;
+function TVdxFFNWeights.BuildFromGGUF(const AReader: TVdxGGUFReader): Boolean;
 var
   LTensorList: TList<TVdxGGUFTensorInfo>;
   LTensor: TVdxGGUFTensorInfo;
@@ -194,11 +189,7 @@ begin
   Result := True;
 end;
 
-// ============================================================================
-//  GPU Upload — Staging buffer pattern
-// ============================================================================
-
-procedure TVdxVindex.UploadLayer(const ALayerIndex: Integer; const ACompute: TVdxVulkanCompute);
+procedure TVdxFFNWeights.UploadLayer(const ALayerIndex: Integer; const ACompute: TVdxVulkanCompute);
 var
   LStaging: TVdxGpuBuffer;
 begin
@@ -253,7 +244,7 @@ begin
   end;
 end;
 
-procedure TVdxVindex.UploadAll(const ACompute: TVdxVulkanCompute);
+procedure TVdxFFNWeights.UploadAll(const ACompute: TVdxVulkanCompute);
 var
   LI: Integer;
 begin
@@ -261,11 +252,7 @@ begin
     UploadLayer(LI, ACompute);
 end;
 
-// ============================================================================
-//  GPU Cleanup
-// ============================================================================
-
-procedure TVdxVindex.FreeLayerGpu(const ALayerIndex: Integer; const ACompute: TVdxVulkanCompute);
+procedure TVdxFFNWeights.FreeLayerGpu(const ALayerIndex: Integer; const ACompute: TVdxVulkanCompute);
 begin
   TVdxUtils.FailIf((ALayerIndex < 0) or (ALayerIndex >= FLayerCount),
     'FreeLayerGpu: layer index %d out of range [0..%d]',
@@ -278,7 +265,7 @@ begin
     ACompute.DestroyGpuBuffer(FLayers[ALayerIndex].DownGpuBuffer);
 end;
 
-procedure TVdxVindex.FreeAllGpu(const ACompute: TVdxVulkanCompute);
+procedure TVdxFFNWeights.FreeAllGpu(const ACompute: TVdxVulkanCompute);
 var
   LI: Integer;
 begin
@@ -286,16 +273,12 @@ begin
     FreeLayerGpu(LI, ACompute);
 end;
 
-// ============================================================================
-//  Accessors
-// ============================================================================
-
-function TVdxVindex.GetLayerCount(): Integer;
+function TVdxFFNWeights.GetLayerCount(): Integer;
 begin
   Result := FLayerCount;
 end;
 
-function TVdxVindex.GetLayer(const AIndex: Integer): TVdxFFNLayerView;
+function TVdxFFNWeights.GetLayer(const AIndex: Integer): TVdxFFNLayerView;
 begin
   TVdxUtils.FailIf((AIndex < 0) or (AIndex >= FLayerCount),
     'GetLayer: index %d out of range [0..%d]',
@@ -303,12 +286,12 @@ begin
   Result := FLayers[AIndex];
 end;
 
-function TVdxVindex.GetHiddenDim(): UInt64;
+function TVdxFFNWeights.GetHiddenDim(): UInt64;
 begin
   Result := FHiddenDim;
 end;
 
-function TVdxVindex.GetFFNWidth(): UInt64;
+function TVdxFFNWeights.GetFFNWidth(): UInt64;
 begin
   Result := FFFNWidth;
 end;

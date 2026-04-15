@@ -1,8 +1,10 @@
 {===============================================================================
-  VindexLLM - Graph-Walk LLM Inference Engine
+  VindexLLM™ - Liberating LLM inference
 
-  Copyright (c) 2026-present tinyBigGAMES LLC
+  Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
+
+  https://vindexllm.com
 
   See LICENSE for license information
 ===============================================================================}

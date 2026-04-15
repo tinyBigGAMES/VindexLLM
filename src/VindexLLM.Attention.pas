@@ -1,8 +1,10 @@
-{===============================================================================
-  VindexLLM - Graph-Walk LLM Inference Engine
+﻿{===============================================================================
+  VindexLLM™ - Liberating LLM inference
 
-  Copyright (c) 2026-present tinyBigGAMES LLC
+  Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
+
+  https://vindexllm.com
 
   See LICENSE for license information
 ===============================================================================}
@@ -17,23 +19,25 @@ uses
   System.SysUtils,
   VindexLLM.Utils,
   VindexLLM.GGUFReader,
-  VindexLLM.VulkanCompute;
-
-// ============================================================================
-//  Push Constant Records (must match shader layouts exactly)
-// ============================================================================
+  VindexLLM.Vulkan,
+  VindexLLM.Compute;
 
 type
+
+  { TVdxMatVecF16Push }
   TVdxMatVecF16Push = record
     InDimHalf: UInt32;
     OutDim: UInt32;
   end;
+
+  { TVdxQKNormPush }
   TVdxQKNormPush = record
     HeadDim: UInt32;
     NumHeads: UInt32;
     Eps: Single;
   end;
 
+  { TVdxRoPEPush }
   TVdxRoPEPush = record
     HeadDim: UInt32;
     NumHeads: UInt32;
@@ -41,7 +45,7 @@ type
     ThetaBase: Single;
   end;
 
-  // Multi-head push constants (all heads in one dispatch)
+  { TVdxAttnScoresMHPush }
   TVdxAttnScoresMHPush = record
     HeadDim: UInt32;
     SeqLen: UInt32;
@@ -51,12 +55,14 @@ type
     GqaRatio: UInt32;
   end;
 
+  { TVdxSoftmaxMHPush }
   TVdxSoftmaxMHPush = record
     SeqLen: UInt32;
     MaxSeq: UInt32;
     NumQHeads: UInt32;
   end;
 
+  { TVdxAttnValueMHPush }
   TVdxAttnValueMHPush = record
     HeadDim: UInt32;
     SeqLen: UInt32;
@@ -65,7 +71,7 @@ type
     GqaRatio: UInt32;
   end;
 
-  // KV cache store push constants (scatter K/V heads into cache)
+  { TVdxKVCacheStorePush }
   TVdxKVCacheStorePush = record
     HeadDim: UInt32;
     MaxSeq: UInt32;
@@ -73,14 +79,14 @@ type
     NumKVHeads: UInt32;
   end;
 
-  // Batch matmul push constants (prefill: W x InputMatrix -> OutputMatrix)
+  { TVdxMatMulPush }
   TVdxMatMulPush = record
     InDimParam: UInt32;   // in_dim/2 for F16, in_dim for Q8_0
     OutDim: UInt32;
     NumTokens: UInt32;
   end;
 
-  // Batched RoPE push constants (Phase 6D prefill)
+  { TVdxRoPEBatchPush }
   TVdxRoPEBatchPush = record
     HeadDim: UInt32;
     NumHeads: UInt32;
@@ -89,7 +95,7 @@ type
     StartPos: UInt32;
   end;
 
-  // Batched KV cache store push constants (Phase 6D prefill)
+  { TVdxKVCacheStoreBatchPush }
   TVdxKVCacheStoreBatchPush = record
     HeadDim: UInt32;
     MaxSeq: UInt32;
@@ -98,7 +104,7 @@ type
     StartPos: UInt32;
   end;
 
-  // Prefill attention scores push constants (Phase 6D)
+  { TVdxAttnScoresPrefillPush }
   TVdxAttnScoresPrefillPush = record
     HeadDim: UInt32;
     NumTokens: UInt32;
@@ -108,13 +114,13 @@ type
     GqaRatio: UInt32;
   end;
 
-  // Prefill softmax push constants (Phase 6D)
+  { TVdxSoftmaxPrefillPush }
   TVdxSoftmaxPrefillPush = record
     NumTokens: UInt32;
     NumQHeads: UInt32;
   end;
 
-  // Prefill attention value push constants (Phase 6D)
+  { TVdxAttnValuePrefillPush }
   TVdxAttnValuePrefillPush = record
     HeadDim: UInt32;
     NumTokens: UInt32;
@@ -122,10 +128,8 @@ type
     NumQHeads: UInt32;
     GqaRatio: UInt32;
   end;
-// ============================================================================
-//  Per-Layer Attention Weight GPU Buffers
-// ============================================================================
 
+  { TVdxAttnLayerWeights }
   TVdxAttnLayerWeights = record
     QWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2560 x 2048] = Q projection
     KWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2560 x 1024] = K projection
@@ -133,10 +137,6 @@ type
     OWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2048 x 2560] = output projection
     WeightType: TVdxGGMLType;    // tensor format (gtF16 or gtQ4_0)
   end;
-
-// ============================================================================
-//  TVdxAttention — Full attention layer (QKV + QK-norm + RoPE + GQA + O)
-// ============================================================================
 
   { TVdxAttention }
   TVdxAttention = class(TVdxBaseObject)
@@ -319,10 +319,8 @@ implementation
 uses
   System.IOUtils,
   VindexLLM.Shaders;
-// ============================================================================
-//  TVdxAttention — Construction / Destruction
-// ============================================================================
 
+{ TVdxAttention }
 constructor TVdxAttention.Create();
 begin
   inherited;
@@ -379,6 +377,7 @@ begin
   FValuePrefillBundle.Pipeline := VK_NULL_HANDLE;
   FPrefillDescPool := VK_NULL_HANDLE;
 end;
+
 destructor TVdxAttention.Destroy();
 begin
   if FCompute <> nil then
@@ -386,10 +385,6 @@ begin
 
   inherited;
 end;
-
-// ============================================================================
-//  TVdxAttention — LoadShader helper
-// ============================================================================
 
 function TVdxAttention.LoadShader(const AFileName: string): VkShaderModule;
 var
@@ -399,9 +394,6 @@ begin
   Result := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 end;
-// ============================================================================
-//  TVdxAttention — Init: Load shaders, create pipelines, allocate buffers
-// ============================================================================
 
 procedure TVdxAttention.Init(const ACompute: TVdxVulkanCompute;
   const AHiddenDim: UInt32; const ANumQHeads: UInt32;
@@ -590,9 +582,6 @@ begin
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 end;
-// ============================================================================
-//  TVdxAttention — Cleanup
-// ============================================================================
 
 procedure TVdxAttention.Cleanup();
 var
@@ -684,9 +673,6 @@ begin
 
   FCompute := nil;
 end;
-// ============================================================================
-//  TVdxAttention — DispatchMatVec: F16 weight matrix × F32 input → F32 output
-// ============================================================================
 
 procedure TVdxAttention.DispatchMatVec(const AWeightBuf: TVdxGpuBuffer;
   const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
@@ -729,9 +715,6 @@ begin
     SizeOf(LPush),
     LGroups);
 end;
-// ============================================================================
-//  TVdxAttention — TestMatVec: Public wrapper for testing
-// ============================================================================
 
 procedure TVdxAttention.TestMatVec(const AWeightBuf: TVdxGpuBuffer;
   const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
@@ -740,12 +723,6 @@ procedure TVdxAttention.TestMatVec(const AWeightBuf: TVdxGpuBuffer;
 begin
   DispatchMatVec(AWeightBuf, AInputBuf, AOutputBuf, AInDim, AOutDim, ATensorType);
 end;
-
-// ============================================================================
-//  TVdxAttention — DispatchBatchMatMul: batched matrix multiply for prefill
-//  W[OutDim x InDim] x Input[NumTokens x InDim] -> Output[NumTokens x OutDim]
-//  2D dispatch: (OutDim, NumTokens) workgroups — each does one dot product
-// ============================================================================
 
 procedure TVdxAttention.DispatchBatchMatMul(const AWeightBuf: TVdxGpuBuffer;
   const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
@@ -784,10 +761,6 @@ begin
     AOutDim, ANumTokens);
 end;
 
-// ============================================================================
-//  TVdxAttention — BatchMatMul: Public wrapper for batched matrix multiply
-// ============================================================================
-
 procedure TVdxAttention.BatchMatMul(const AWeightBuf: TVdxGpuBuffer;
   const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
   const AInDim: UInt32; const AOutDim: UInt32;
@@ -796,14 +769,6 @@ begin
   DispatchBatchMatMul(AWeightBuf, AInputBuf, AOutputBuf,
     AInDim, AOutDim, ANumTokens, ATensorType);
 end;
-
-// ============================================================================
-//  TVdxAttention — ForwardBatch: batched attention for prefill (Phase 6D)
-//  Processes all NumTokens through one layer simultaneously.
-//  AInputMat: pre-normed input [NumTokens x HiddenDim]
-//  AQMat/AKMat/AVMat: scratch matrices (caller-allocated)
-//  AAttnOutMat: output [NumTokens x HiddenDim]
-// ============================================================================
 
 procedure TVdxAttention.ForwardBatch(const AInputMat: TVdxGpuBuffer;
   const AWeights: TVdxAttnLayerWeights;
@@ -938,9 +903,6 @@ begin
     FNumQHeads * FHeadDim, FHiddenDim, ANumTokens, AWeights.WeightType);
   FCompute.BatchBarrier(); // AAttnOutMat ready for caller
 end;
-// ============================================================================
-//  TVdxAttention — Upload Attention Weights from GGUF
-// ============================================================================
 
 procedure TVdxAttention.UploadAttnWeights(const AReader: TVdxGGUFReader;
   const ALayerIndex: Integer; out AWeights: TVdxAttnLayerWeights);
@@ -1004,10 +966,6 @@ begin
     Format('blk.%d.attn_output.weight', [ALayerIndex]));
 end;
 
-// ============================================================================
-//  TVdxAttention — Free Attention Weight GPU Buffers
-// ============================================================================
-
 procedure TVdxAttention.FreeAttnWeights(var AWeights: TVdxAttnLayerWeights);
 begin
   if AWeights.QWeightGpu.Buffer <> VK_NULL_HANDLE then
@@ -1019,9 +977,6 @@ begin
   if AWeights.OWeightGpu.Buffer <> VK_NULL_HANDLE then
     FCompute.DestroyGpuBuffer(AWeights.OWeightGpu);
 end;
-// ============================================================================
-//  TVdxAttention — Diagnostic accessors for KV cache
-// ============================================================================
 
 function TVdxAttention.GetKCache(const ALayerIndex: Integer): TVdxGpuBuffer;
 begin
@@ -1032,10 +987,6 @@ function TVdxAttention.GetVCache(const ALayerIndex: Integer): TVdxGpuBuffer;
 begin
   Result := FVCache[ALayerIndex];
 end;
-
-// ============================================================================
-//  TVdxAttention — Forward: Full attention for one layer at one position
-// ============================================================================
 
 procedure TVdxAttention.Forward(const AInputBuf: TVdxGpuBuffer;
   const AWeights: TVdxAttnLayerWeights;

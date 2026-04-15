@@ -1,5 +1,5 @@
-{===============================================================================
-  VindexLLM™ - Graph-Walk LLM Inference Engine
+﻿{===============================================================================
+  VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
@@ -7,9 +7,6 @@
   https://vindexllm.com
 
   See LICENSE for license information
-
-  Based on TVirtualBuffer by tinyBigGAMES™ LLC
-  https://github.com/tinyBigGAMES/VirtualBuffer
 ===============================================================================}
 
 unit VindexLLM.VirtualBuffer;
@@ -81,10 +78,7 @@ type
 
 implementation
 
-// ============================================================================
-//  TVdxVirtualBuffer<T> — Private
-// ============================================================================
-
+{ TVdxVirtualBuffer }
 procedure TVdxVirtualBuffer<T>.Lock();
 begin
   FCriticalSection.Enter();
@@ -150,10 +144,6 @@ begin
   end;
 end;
 
-// ============================================================================
-//  TVdxVirtualBuffer<T> — Construction / Destruction
-// ============================================================================
-
 constructor TVdxVirtualBuffer<T>.Create(const ASize: UInt64);
 var
   LSizeHigh: DWORD;
@@ -188,10 +178,6 @@ begin
   FCriticalSection.Free();
   inherited;
 end;
-
-// ============================================================================
-//  TVdxVirtualBuffer<T> — Stream Read/Write
-// ============================================================================
 
 function TVdxVirtualBuffer<T>.Write(const ABuffer; const ACount: UInt64): UInt64;
 begin
@@ -259,10 +245,6 @@ begin
   end;
 end;
 
-// ============================================================================
-//  TVdxVirtualBuffer<T> — String Serialization
-// ============================================================================
-
 function TVdxVirtualBuffer<T>.ReadString(): string;
 var
   LLen: UInt64;
@@ -287,10 +269,6 @@ begin
     Unlock();
   end;
 end;
-
-// ============================================================================
-//  TVdxVirtualBuffer<T> — File I/O
-// ============================================================================
 
 procedure TVdxVirtualBuffer<T>.SaveToFile(const AFilename: string);
 var
@@ -325,10 +303,6 @@ begin
   end;
 end;
 
-// ============================================================================
-//  TVdxVirtualBuffer<T> — Buffer Operations
-// ============================================================================
-
 procedure TVdxVirtualBuffer<T>.ZeroMemory();
 begin
   Lock();
@@ -350,10 +324,6 @@ begin
     Unlock();
   end;
 end;
-
-// ============================================================================
-//  TVdxVirtualBuffer<T> — End of Buffer
-// ============================================================================
 
 function TVdxVirtualBuffer<T>.Eob(): Boolean;
 begin

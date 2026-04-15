@@ -1,5 +1,5 @@
-{===============================================================================
-  VindexLLM™ - Graph-Walk LLM Inference Engine
+﻿{===============================================================================
+  VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
@@ -23,46 +23,48 @@ uses
   System.Diagnostics,
   System.Generics.Collections,
   VindexLLM.Utils,
+  VindexLLM.Vulkan,
   VindexLLM.GGUFReader,
-  VindexLLM.VulkanCompute,
+  VindexLLM.Compute,
   VindexLLM.LayerNorm,
   VindexLLM.Attention,
-  VindexLLM.Vindex,
   VindexLLM.Tokenizer,
   VindexLLM.ChatTemplate,
   VindexLLM.VirtualBuffer,
-  VindexLLM.Shaders;
+  VindexLLM.Shaders,
+  VIndexLLM.FFNWeights;
 
 // ============================================================================
 //  Push constants for shaders
 // ============================================================================
 
 type
+
+  { TVdxGeluMulPush }
   TVdxGeluMulPush = record
     Count: UInt32;
   end;
 
+  { TVdxVecAddPush }
   TVdxVecAddPush = record
     Count: UInt32;
   end;
 
+  { TVdxEmbedLookupPush }
   TVdxEmbedLookupPush = record
     TokenId: UInt32;
     DimParam: UInt32;    // hidden_dim/2 for F16, hidden_dim for Q8_0
     EmbedScale: Single;
   end;
 
-  // Batched embedding lookup push constants (Phase 6D)
+  { TVdxEmbedBatchPush }
   TVdxEmbedBatchPush = record
     DimParam: UInt32;    // hidden_dim/2 for F16, hidden_dim for Q8_0
     EmbedScale: Single;
     NumTokens: UInt32;
   end;
 
-// ============================================================================
-//  Stop reason — why generation ended
-// ============================================================================
-
+  { TVdxStopReason }
   TVdxStopReason = (
     srNone,              // Not yet generated
     srEOS,               // End-of-sequence token
@@ -71,10 +73,7 @@ type
     srCallbackStopped    // Token callback returned False
   );
 
-// ============================================================================
-//  Inference stats — filled by Generate(), read via GetStats()
-// ============================================================================
-
+  { TVdxInferenceStats }
   TVdxInferenceStats = record
     PrefillTokens: Integer;
     PrefillTimeMs: Double;
@@ -88,17 +87,10 @@ type
   end;
   PVdxInferenceStats = ^TVdxInferenceStats;
 
-// ============================================================================
-//  Token callback — return True to continue, False to stop generation
-// ============================================================================
-
+  { TVdxTokenCallback }
   TVdxTokenCallback = reference to function(
     const AToken: string;
     const AUserData: Pointer): Boolean;
-
-// ============================================================================
-//  TVdxInference — Dense transformer inference engine
-// ============================================================================
 
   { TVdxInference }
   TVdxInference = class(TVdxStatusObject)
@@ -108,7 +100,7 @@ type
     FCompute: TVdxVulkanCompute;
     FNorm: TVdxLayerNorm;
     FAttn: TVdxAttention;
-    FVindex: TVdxVindex;
+    FVindex: TVdxFFNWeights;
     FTokenizer: TVdxTokenizer;
 
     // Token callback
@@ -220,7 +212,7 @@ type
     FStats: TVdxInferenceStats;
 
     // Private helpers
-    function F16ToF32(const AVal: UInt16): Single;
+    //function F16ToF32(const AVal: UInt16): Single;
     function UploadNormWeight(const ATensorName: string;
       const ACount: UInt32): TVdxGpuBuffer;
     function UploadWeightTensor(const ATensorName: string): TVdxGpuBuffer;
@@ -254,12 +246,14 @@ type
     function GetStats(): PVdxInferenceStats;
   end;
 
+const
+  { CVdxStopReasons }
+  CVdxStopReasons: array[TVdxStopReason] of string = (
+    'none', 'eos', 'stop_token', 'max_tokens', 'callback_stopped');
+
 implementation
 
-// ============================================================================
-//  TVdxInference — Construction / Destruction
-// ============================================================================
-
+{ TVdxInference }
 constructor TVdxInference.Create();
 begin
   inherited;
@@ -288,10 +282,7 @@ begin
   inherited;
 end;
 
-// ============================================================================
-//  F16ToF32 — Convert IEEE 754 half-precision to single-precision
-// ============================================================================
-
+(*
 function TVdxInference.F16ToF32(const AVal: UInt16): Single;
 const
   CSignBit: UInt32 = $80000000;
@@ -329,11 +320,7 @@ begin
 
   Move(LBits, Result, 4);
 end;
-
-// ============================================================================
-//  UploadNormWeight — Upload F32 norm weight from GGUF to GPU
-//  GGUF stores effective weight (Gemma +1 offset already applied)
-// ============================================================================
+*)
 
 function TVdxInference.UploadNormWeight(const ATensorName: string;
   const ACount: UInt32): TVdxGpuBuffer;
@@ -351,10 +338,6 @@ begin
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
   FCompute.UploadToBuffer(Result, @LData[0], UInt64(ACount) * SizeOf(Single));
 end;
-
-// ============================================================================
-//  UploadWeightTensor — Upload any weight tensor (F16/Q4_0) to device-local GPU
-// ============================================================================
 
 function TVdxInference.UploadWeightTensor(const ATensorName: string): TVdxGpuBuffer;
 var
@@ -384,13 +367,6 @@ begin
     FCompute.DestroyGpuBuffer(LStaging);
   end;
 end;
-
-// ============================================================================
-//  EmbedToken — GPU embedding lookup: read from embedding table on GPU,
-//  dequantize + scale, write to residual buffer. No CPU→GPU transfer.
-//  F32 fallback: CPU conversion + upload (rare, kept for completeness).
-//  Must be called inside an active batch (BeginBatch/EndBatch).
-// ============================================================================
 
 procedure TVdxInference.EmbedToken(const ATokenId: Integer);
 var
@@ -433,13 +409,6 @@ begin
   end;
 end;
 
-// ============================================================================
-//  EmbedTokensBatch — GPU batched embedding: look up N tokens at once,
-//  dequantize + scale, write to output matrix [N x HiddenDim].
-//  Uploads token IDs to GPU, then dispatches batched embed shader.
-//  Must be called inside an active batch (BeginBatch/EndBatch).
-// ============================================================================
-
 procedure TVdxInference.EmbedTokensBatch(const ATokenIds: TArray<Integer>;
   const ANumTokens: Integer; const AOutputBuf: TVdxGpuBuffer);
 var
@@ -479,12 +448,6 @@ begin
   end;
   FCompute.BatchBarrier(); // Output matrix ready for first layer
 end;
-
-// ============================================================================
-//  RunLayerForward — Process one transformer layer (attn + FFN)
-//  Sandwich norm pattern: PreNorm → Op → PostNorm → residual add
-//  All operations recorded into the active batch — no individual submits
-// ============================================================================
 
 procedure TVdxInference.RunLayerForward(const ALayer: Integer;
   const APosition: Integer);
@@ -575,12 +538,6 @@ begin
   FCompute.BatchBarrier(); // Residual ready for next layer
 end;
 
-// ============================================================================
-//  RunLayerForwardBatch — Process one transformer layer for N tokens (Phase 6D)
-//  Same sandwich norm pattern as RunLayerForward but on matrices.
-//  Uses batched matmul, batched norms, and existing vec-add/gelu-mul with N×dim.
-// ============================================================================
-
 procedure TVdxInference.RunLayerForwardBatch(const ALayer: Integer;
   const ANumTokens: UInt32);
 var
@@ -663,12 +620,6 @@ begin
   FCompute.BatchBarrier();
 end;
 
-// ============================================================================
-//  RunUnembedding — Apply final norm, GPU matvec for logits, CPU argmax
-//  Called inside an active batch — records norm + matvec, then EndBatch
-//  is called by the caller before downloading logits
-// ============================================================================
-
 function TVdxInference.RunUnembedding(): Integer;
 var
   LBestId: Integer;
@@ -708,10 +659,6 @@ begin
   Result := LBestId;
 end;
 
-// ============================================================================
-//  LoadModel — Open GGUF, init Vulkan subsystems, upload all weights
-// ============================================================================
-
 procedure TVdxInference.LoadModel(const AGGUFPath: string);
 var
   LLayer: Integer;
@@ -729,7 +676,7 @@ begin
   FCompute := TVdxVulkanCompute.Create();
   FNorm := TVdxLayerNorm.Create();
   FAttn := TVdxAttention.Create();
-  FVindex := TVdxVindex.Create();
+  FVindex := TVdxFFNWeights.Create();
   FTokenizer := TVdxTokenizer.Create();
 
   // Forward status callback to subsystems
@@ -1054,20 +1001,12 @@ begin
   Status('Model loaded successfully');
 end;
 
-// ============================================================================
-//  SetTokenCallback
-// ============================================================================
-
 procedure TVdxInference.SetTokenCallback(const ACallback: TVdxTokenCallback;
   const AUserData: Pointer);
 begin
   FTokenCallback.Callback := ACallback;
   FTokenCallback.UserData := AUserData;
 end;
-
-// ============================================================================
-//  AddStopToken / ClearStopTokens
-// ============================================================================
 
 procedure TVdxInference.AddStopToken(const ATokenId: Integer);
 begin
@@ -1084,19 +1023,10 @@ begin
     FStopTokenIds.Add(FTokenizer.GetEosId());
 end;
 
-// ============================================================================
-//  GetStats — Return pointer to internal stats record
-// ============================================================================
-
 function TVdxInference.GetStats(): PVdxInferenceStats;
 begin
   Result := @FStats;
 end;
-
-// ============================================================================
-//  Generate — Tokenize, prefill, then autoregressive token generation
-//  Uses batched dispatch: one GPU submit per token for all 34 layers
-// ============================================================================
 
 function TVdxInference.Generate(const APrompt: string;
   const AMaxTokens: Integer): string;
@@ -1216,10 +1146,6 @@ begin
     LResult.Free();
   end;
 end;
-
-// ============================================================================
-//  UnloadModel — Release all GPU resources and destroy subsystem objects
-// ============================================================================
 
 procedure TVdxInference.UnloadModel();
 var

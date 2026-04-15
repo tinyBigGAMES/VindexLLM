@@ -1,3 +1,14 @@
+{===============================================================================
+  VindexLLM™ - Liberating LLM inference
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://vindexllm.com
+
+  See LICENSE for license information
+===============================================================================}
+
 unit UVdxTestbed;
 
 interface
@@ -26,18 +37,15 @@ begin
 end;
 
 procedure PrintStats(const AStats: PVdxInferenceStats);
-const
-  CStopReasons: array[TVdxStopReason] of string = (
-    'none', 'eos', 'stop_token', 'max_tokens', 'callback_stopped');
 begin
-  WriteLn;
-  WriteLn(Format('Prefill:    %d tokens in %.0fms (%.1f tok/s)', [
-    AStats.PrefillTokens, AStats.PrefillTimeMs, AStats.PrefillTokPerSec]));
-  WriteLn(Format('Generation: %d tokens in %.0fms (%.1f tok/s)', [
-    AStats.GeneratedTokens, AStats.GenerationTimeMs, AStats.GenerationTokPerSec]));
-  WriteLn(Format('TTFT: %.0fms | Total: %.0fms | Stop: %s', [
+  TVdxUtils.PrintLn();
+  TVdxUtils.PrintLn('Prefill:    %d tokens in %.0fms (%.1f tok/s)', [
+    AStats.PrefillTokens, AStats.PrefillTimeMs, AStats.PrefillTokPerSec]);
+  TVdxUtils.PrintLn('Generation: %d tokens in %.0fms (%.1f tok/s)', [
+    AStats.GeneratedTokens, AStats.GenerationTimeMs, AStats.GenerationTokPerSec]);
+  TVdxUtils.PrintLn('TTFT: %.0fms | Total: %.0fms | Stop: %s', [
     AStats.TimeToFirstTokenMs, AStats.TotalTimeMs,
-    CStopReasons[AStats.StopReason]]));
+    CVdxStopReasons[AStats.StopReason]]);
 end;
 
 procedure Test01();
@@ -58,13 +66,11 @@ begin
   LInference := TVdxInference.Create();
   try
     LInference.SetStatusCallback(StatusCallback, nil);
-    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf');
-    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-Q8_0.gguf');
+    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.f16.gguf');
     LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
     LInference.SetTokenCallback(PrintToken, nil);
-    //LInference.Generate('What is the capital of France?');
-    //LInference.Generate('Who is bill gates?');
-    LInference.Generate(CPrompt);
+    //LInference.Generate(CPrompt);
+    LInference.Generate('how to make kno3?', 512);
     PrintStats(LInference.GetStats());
     LInference.UnloadModel();
   finally

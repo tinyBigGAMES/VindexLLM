@@ -1,10 +1,10 @@
-{===============================================================================
-  VindexLLM™ - Graph-Walk LLM Inference Engine
+﻿{===============================================================================
+  VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
 
-  https://vipervm.org
+  https://vindexllm.com
 
   See LICENSE for license information
 ===============================================================================}
@@ -41,31 +41,6 @@ resourcestring
   RSFatalFileNotFound  = 'File not found: ''%s''';
   RSFatalFileReadError = 'Cannot read file ''%s'': %s';
   RSFatalInternalError = 'Internal error: %s';
-
-  //--------------------------------------------------------------------------
-  // User Lexer Messages
-  //--------------------------------------------------------------------------
-  RSUserLexerUnexpectedChar      = 'Unexpected character: ''%s''';
-  RSUserLexerUnterminatedString  = 'Unterminated string literal';
-  RSUserLexerUnterminatedComment = 'Unterminated comment';
-  RSUserLexerUnknownDirective    = 'Unknown directive: ''%s''';
-
-  //--------------------------------------------------------------------------
-  // User Parser Messages
-  //--------------------------------------------------------------------------
-  RSUserParserExpectedToken      = 'Expected %s but found ''%s''';
-  RSUserParserNoPrefixHandler    = 'Unexpected token in expression: ''%s''';
-
-  //--------------------------------------------------------------------------
-  // Status Messages
-  //--------------------------------------------------------------------------
-  RSUserLexerTokenizing          = 'Tokenizing %s...';
-  RSUserParserParsing            = 'Parsing %s...';
-  RSUserSemanticAnalyzing        = 'Analyzing %s...';
-  RSUserCodeGenEmitting          = 'Emitting %s...';
-  RSEngineTargetPlatform         = 'Target: %s';
-  RSEngineBuildMode              = 'Build mode: %s';
-  RSEngineOptimizeLevel          = 'Optimization: %s';
 
 implementation
 

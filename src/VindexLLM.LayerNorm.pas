@@ -1,5 +1,5 @@
-{===============================================================================
-  VindexLLM™ - Graph-Walk LLM Inference Engine
+﻿{===============================================================================
+  VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
@@ -19,24 +19,25 @@ uses
   System.SysUtils,
   VindexLLM.Utils,
   VindexLLM.GGUFReader,
-  VindexLLM.VulkanCompute;
+  VindexLLM.Vulkan,
+  VindexLLM.Compute;
 
 type
 
-  // Push constant layout matching rmsnorm.comp
+  { TVdxRMSNormPush }
   TVdxRMSNormPush = record
     HiddenDim: UInt32;
     Eps: Single;
   end;
 
-  // Push constant layout matching rmsnorm_batch.comp / rmsnorm_copy_batch.comp
+  { TVdxRMSNormBatchPush }
   TVdxRMSNormBatchPush = record
     HiddenDim: UInt32;
     Eps: Single;
     NumTokens: UInt32;
   end;
 
-  // Per-layer norm weight GPU buffers (Gemma 3 sandwich norm pattern)
+  { TVdxNormLayerWeights }
   TVdxNormLayerWeights = record
     AttnNormGpu: TVdxGpuBuffer;       // F32 x HiddenDim, pre-attention norm
     PostAttnNormGpu: TVdxGpuBuffer;   // F32 x HiddenDim, post-attention norm
@@ -122,10 +123,7 @@ uses
   System.IOUtils,
   VindexLLM.Shaders;
 
-// ============================================================================
-//  TVdxLayerNorm — Construction / Destruction
-// ============================================================================
-
+{ TVdxLayerNorm }
 constructor TVdxLayerNorm.Create();
 begin
   inherited;
@@ -163,10 +161,6 @@ begin
 
   inherited;
 end;
-
-// ============================================================================
-//  TVdxLayerNorm — Init: Load shader, create pipeline
-// ============================================================================
 
 procedure TVdxLayerNorm.Init(const ACompute: TVdxVulkanCompute;
   const AEpsilon: Single);
@@ -243,10 +237,6 @@ begin
   Status('LayerNorm: Ready');
 end;
 
-// ============================================================================
-//  TVdxLayerNorm — Cleanup
-// ============================================================================
-
 procedure TVdxLayerNorm.Cleanup();
 begin
   if FCompute = nil then
@@ -304,10 +294,6 @@ begin
   FCompute := nil;
 end;
 
-// ============================================================================
-//  TVdxLayerNorm — Apply: RMSNorm in-place on residual
-// ============================================================================
-
 procedure TVdxLayerNorm.Apply(const AResidualBuf: TVdxGpuBuffer;
   const AWeightBuf: TVdxGpuBuffer; const AHiddenDim: UInt32);
 var
@@ -329,10 +315,6 @@ begin
     1  // 1 workgroup
   );
 end;
-
-// ============================================================================
-//  TVdxLayerNorm — ApplyCopy: Fused read-source + RMSNorm + write-dest
-// ============================================================================
 
 procedure TVdxLayerNorm.ApplyCopy(const ASourceBuf: TVdxGpuBuffer;
   const AWeightBuf: TVdxGpuBuffer; const ADestBuf: TVdxGpuBuffer;
@@ -358,11 +340,6 @@ begin
   );
 end;
 
-// ============================================================================
-//  TVdxLayerNorm — ApplyBatch: in-place RMSNorm on matrix [N x HiddenDim]
-//  Dispatch (NumTokens, 1, 1) — one workgroup per row
-// ============================================================================
-
 procedure TVdxLayerNorm.ApplyBatch(const AMatrixBuf: TVdxGpuBuffer;
   const AWeightBuf: TVdxGpuBuffer; const AHiddenDim: UInt32;
   const ANumTokens: UInt32);
@@ -386,11 +363,6 @@ begin
   );
 end;
 
-// ============================================================================
-//  TVdxLayerNorm — ApplyCopyBatch: fused copy+norm on matrices [N x HiddenDim]
-//  Dispatch (NumTokens, 1, 1) — one workgroup per row
-// ============================================================================
-
 procedure TVdxLayerNorm.ApplyCopyBatch(const ASourceBuf: TVdxGpuBuffer;
   const AWeightBuf: TVdxGpuBuffer; const ADestBuf: TVdxGpuBuffer;
   const AHiddenDim: UInt32; const ANumTokens: UInt32);
@@ -413,10 +385,6 @@ begin
     ANumTokens  // one workgroup per token row
   );
 end;
-
-// ============================================================================
-//  TVdxLayerNorm — Upload Norm Weights from GGUF
-// ============================================================================
 
 procedure TVdxLayerNorm.UploadNormWeights(const AReader: TVdxGGUFReader;
   const ALayerIndex: Integer; out AWeights: TVdxNormLayerWeights);
@@ -478,10 +446,6 @@ begin
 
   Status('LayerNorm: Uploaded 6 norm weights for layer %d', [ALayerIndex]);
 end;
-
-// ============================================================================
-//  TVdxLayerNorm — Free Norm Weight GPU Buffers
-// ============================================================================
 
 procedure TVdxLayerNorm.FreeNormWeights(var AWeights: TVdxNormLayerWeights);
 begin

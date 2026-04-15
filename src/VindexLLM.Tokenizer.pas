@@ -1,8 +1,10 @@
-{===============================================================================
-  VindexLLM - Graph-Walk LLM Inference Engine
+﻿{===============================================================================
+  VindexLLM™ - Liberating LLM inference
 
-  Copyright (c) 2026-present tinyBigGAMES LLC
+  Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
+
+  https://vindexllm.com
 
   See LICENSE for license information
 ===============================================================================}
@@ -21,7 +23,8 @@ uses
   VindexLLM.GGUFReader;
 
 type
-  // Token type flags from GGUF (matches llama.cpp token types)
+
+  { TVdxTokenType }
   TVdxTokenType = (
     ttNormal = 1,
     ttUnknown = 2,
@@ -75,10 +78,7 @@ implementation
 uses
   System.Math;
 
-// ============================================================================
-//  TVdxTokenizer — Construction / Destruction
-// ============================================================================
-
+{ TVdxTokenizer }
 constructor TVdxTokenizer.Create();
 begin
   inherited;
@@ -93,10 +93,6 @@ begin
   FTokenToId.Free();
   inherited;
 end;
-
-// ============================================================================
-//  TVdxTokenizer — Load vocabulary from GGUF
-// ============================================================================
 
 function TVdxTokenizer.LoadFromGGUF(const AReader: TVdxGGUFReader): Boolean;
 var
@@ -177,11 +173,6 @@ begin
   Result := True;
 end;
 
-// ============================================================================
-//  TVdxTokenizer — BPE Merge: find best adjacent pair to merge
-//  Returns index of the left element in the best pair, or -1 if no merge.
-// ============================================================================
-
 function TVdxTokenizer.FindBestMerge(const APieces: TList<Integer>): Integer;
 var
   LI: Integer;
@@ -210,10 +201,6 @@ begin
 
   Result := LBestIdx;
 end;
-
-// ============================================================================
-//  TVdxTokenizer — Encode: text -> token IDs using BPE
-// ============================================================================
 
 function TVdxTokenizer.Encode(const AText: string;
   const AAddBos: Boolean): TArray<Integer>;
@@ -367,10 +354,6 @@ begin
   end;
 end;
 
-// ============================================================================
-//  TVdxTokenizer — Decode: token IDs -> text
-// ============================================================================
-
 function TVdxTokenizer.Decode(const AIds: TArray<Integer>): string;
 var
   LI: Integer;
@@ -390,10 +373,6 @@ begin
     end;
   end;
 end;
-
-// ============================================================================
-//  TVdxTokenizer — Accessors
-// ============================================================================
 
 function TVdxTokenizer.GetVocabSize(): Integer;
 begin
