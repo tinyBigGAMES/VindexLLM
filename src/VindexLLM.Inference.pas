@@ -30,7 +30,8 @@ uses
   VindexLLM.Vindex,
   VindexLLM.Tokenizer,
   VindexLLM.ChatTemplate,
-  VindexLLM.VirtualBuffer;
+  VindexLLM.VirtualBuffer,
+  VindexLLM.Shaders;
 
 // ============================================================================
 //  Push constants for shaders
@@ -715,7 +716,6 @@ procedure TVdxInference.LoadModel(const AGGUFPath: string);
 var
   LLayer: Integer;
   LBufSize: UInt64;
-  LSpvPath: string;
   LSpvData: TBytes;
   LQInfo: TVdxGGUFTensorInfo;
   LProbeIds: TArray<Integer>;
@@ -810,10 +810,7 @@ begin
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
   // --- GELU-mul pipeline (GELU with tanh approximation) ---
-  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\gelu_mul.spv');
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('GELU_MUL');
   FGeluMulShader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
   FGeluMulDescLayout := FCompute.CreateStorageDescriptorSetLayout(2);
@@ -825,10 +822,7 @@ begin
     FGeluMulDescPool, FGeluMulDescLayout, [FGateBuf, FUpBuf]);
 
   // --- Vec-add pipeline (GPU residual += branch output) ---
-  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\vec_add.spv');
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('VEC_ADD');
   FVecAddShader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
   FVecAddDescLayout := FCompute.CreateStorageDescriptorSetLayout(2);
@@ -938,17 +932,11 @@ begin
   FEmbedGpu := UploadWeightTensor('token_embd.weight');
 
   // --- GPU embedding lookup pipeline ---
-  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\embed_lookup_f16.spv');
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('EMBED_LOOKUP_F16');
   FEmbedF16Shader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
-  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\embed_lookup_q8.spv');
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('EMBED_LOOKUP_Q8');
   FEmbedQ8Shader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
@@ -963,17 +951,11 @@ begin
     FEmbedDescPool, FEmbedDescLayout, [FEmbedGpu, FResidualGpu]);
 
   // --- Batched GPU embedding lookup pipeline (Phase 6D) ---
-  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\embed_lookup_batch_f16.spv');
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('EMBED_LOOKUP_BATCH_F16');
   FEmbedBatchF16Shader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
-  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\embed_lookup_batch_q8.spv');
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('EMBED_LOOKUP_BATCH_Q8');
   FEmbedBatchQ8Shader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 

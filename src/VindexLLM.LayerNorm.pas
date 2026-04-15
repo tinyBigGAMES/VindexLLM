@@ -119,7 +119,8 @@ type
 implementation
 
 uses
-  System.IOUtils;
+  System.IOUtils,
+  VindexLLM.Shaders;
 
 // ============================================================================
 //  TVdxLayerNorm — Construction / Destruction
@@ -170,7 +171,6 @@ end;
 procedure TVdxLayerNorm.Init(const ACompute: TVdxVulkanCompute;
   const AEpsilon: Single);
 var
-  LSpvPath: string;
   LSpvData: TBytes;
   LDummyBuf: TVdxGpuBuffer;
 begin
@@ -179,15 +179,8 @@ begin
 
   Status('LayerNorm: Init (eps=%e)', [Double(FEpsilon)]);
 
-  // Load rmsnorm shader from .spv file
-  LSpvPath := TPath.Combine(
-    TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\rmsnorm.spv'
-  );
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
-    'rmsnorm.spv not found: %s', [LSpvPath]);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  // Load rmsnorm shader from embedded resource
+  LSpvData := VdxLoadShader('RMSNORM');
   FShaderModule := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
@@ -205,15 +198,8 @@ begin
   FDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FDescPool, FDescLayout, [LDummyBuf, LDummyBuf]);
 
-  // Load fused copy+norm shader (source → norm → dest, no in-place)
-  LSpvPath := TPath.Combine(
-    TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\rmsnorm_copy.spv'
-  );
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
-    'rmsnorm_copy.spv not found: %s', [LSpvPath]);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  // Load fused copy+norm shader from embedded resource
+  LSpvData := VdxLoadShader('RMSNORM_COPY');
   FShaderModuleCopy := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
@@ -230,14 +216,7 @@ begin
     FDescPoolCopy, FDescLayoutCopy, [LDummyBuf, LDummyBuf, LDummyBuf]);
 
   // --- Batched in-place norm (Phase 6D) ---
-  LSpvPath := TPath.Combine(
-    TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\rmsnorm_batch.spv'
-  );
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
-    'rmsnorm_batch.spv not found: %s', [LSpvPath]);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('RMSNORM_BATCH');
   FShaderModuleBatch := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
@@ -249,14 +228,7 @@ begin
     FDescPoolBatch, FDescLayout, [LDummyBuf, LDummyBuf]);
 
   // --- Batched fused copy+norm (Phase 6D) ---
-  LSpvPath := TPath.Combine(
-    TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\rmsnorm_copy_batch.spv'
-  );
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
-    'rmsnorm_copy_batch.spv not found: %s', [LSpvPath]);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader('RMSNORM_COPY_BATCH');
   FShaderModuleCopyBatch := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 

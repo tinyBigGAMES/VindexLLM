@@ -1,0 +1,49 @@
+// VindexLLM Shader Resources — compiled .spv binaries embedded as RCDATA
+// Auto-compiled by compile.cmd via brcc32
+
+// Matrix-vector (single token generation)
+MATVEC_F16              RCDATA "matvec_f16.spv"
+MATVEC_Q8_0             RCDATA "matvec_q8_0.spv"
+
+// Matrix-matrix (batched prefill)
+MATMUL_F16              RCDATA "matmul_f16.spv"
+MATMUL_Q8_0             RCDATA "matmul_q8_0.spv"
+
+// RMSNorm (single token)
+RMSNORM                 RCDATA "rmsnorm.spv"
+RMSNORM_COPY            RCDATA "rmsnorm_copy.spv"
+
+// RMSNorm (batched prefill)
+RMSNORM_BATCH           RCDATA "rmsnorm_batch.spv"
+RMSNORM_COPY_BATCH      RCDATA "rmsnorm_copy_batch.spv"
+
+// QK-norm and RoPE
+QK_NORM                 RCDATA "qk_norm.spv"
+ROPE                    RCDATA "rope.spv"
+ROPE_BATCH              RCDATA "rope_batch.spv"
+
+// Attention (single token — multi-head fused)
+ATTN_SCORES_MH          RCDATA "attn_scores_mh.spv"
+SOFTMAX_MH              RCDATA "softmax_mh.spv"
+ATTN_VALUE_MH           RCDATA "attn_value_mh.spv"
+
+// Attention (batched prefill — causal)
+ATTN_SCORES_PREFILL     RCDATA "attn_scores_prefill.spv"
+SOFTMAX_PREFILL         RCDATA "softmax_prefill.spv"
+ATTN_VALUE_PREFILL      RCDATA "attn_value_prefill.spv"
+
+// KV cache store
+KV_CACHE_STORE          RCDATA "kv_cache_store.spv"
+KV_CACHE_STORE_BATCH    RCDATA "kv_cache_store_batch.spv"
+
+// Embedding lookup (single token)
+EMBED_LOOKUP_F16        RCDATA "embed_lookup_f16.spv"
+EMBED_LOOKUP_Q8         RCDATA "embed_lookup_q8.spv"
+
+// Embedding lookup (batched prefill)
+EMBED_LOOKUP_BATCH_F16  RCDATA "embed_lookup_batch_f16.spv"
+EMBED_LOOKUP_BATCH_Q8   RCDATA "embed_lookup_batch_q8.spv"
+
+// Activation and residual
+GELU_MUL                RCDATA "gelu_mul.spv"
+VEC_ADD                 RCDATA "vec_add.spv"

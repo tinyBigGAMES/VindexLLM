@@ -317,7 +317,8 @@ type
 implementation
 
 uses
-  System.IOUtils;
+  System.IOUtils,
+  VindexLLM.Shaders;
 // ============================================================================
 //  TVdxAttention — Construction / Destruction
 // ============================================================================
@@ -392,17 +393,9 @@ end;
 
 function TVdxAttention.LoadShader(const AFileName: string): VkShaderModule;
 var
-  LSpvPath: string;
   LSpvData: TBytes;
 begin
-  LSpvPath := TPath.Combine(
-    TPath.GetDirectoryName(ParamStr(0)),
-    '..\shaders\' + AFileName
-  );
-  LSpvPath := TPath.GetFullPath(LSpvPath);
-  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
-    'Attention: shader not found: %s', [LSpvPath]);
-  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  LSpvData := VdxLoadShader(AFileName);
   Result := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 end;
@@ -428,13 +421,13 @@ begin
   FMaxSeqLen := AMaxSeqLen;
 
   // Load all shaders
-  FMatVecShader := LoadShader('matvec_f16.spv');
-  FMatVecQ8Shader := LoadShader('matvec_q8_0.spv');
-  FQKNormShader := LoadShader('qk_norm.spv');
-  FRoPEShader := LoadShader('rope.spv');
-  FAttnScoresMHShader := LoadShader('attn_scores_mh.spv');
-  FSoftmaxMHShader := LoadShader('softmax_mh.spv');
-  FAttnValueMHShader := LoadShader('attn_value_mh.spv');
+  FMatVecShader := LoadShader('MATVEC_F16');
+  FMatVecQ8Shader := LoadShader('MATVEC_Q8_0');
+  FQKNormShader := LoadShader('QK_NORM');
+  FRoPEShader := LoadShader('ROPE');
+  FAttnScoresMHShader := LoadShader('ATTN_SCORES_MH');
+  FSoftmaxMHShader := LoadShader('SOFTMAX_MH');
+  FAttnValueMHShader := LoadShader('ATTN_VALUE_MH');
   // Create descriptor set layouts
   FMatVecDescLayout := FCompute.CreateStorageDescriptorSetLayout(3);
   FQKNormDescLayout := FCompute.CreateStorageDescriptorSetLayout(2);
@@ -530,7 +523,7 @@ begin
   end;
 
   // KV cache store shader — replaces per-head CopyBufferRegion with single dispatch
-  FKVStoreShader := LoadShader('kv_cache_store.spv');
+  FKVStoreShader := LoadShader('KV_CACHE_STORE');
   FKVStoreDescLayout := FCompute.CreateStorageDescriptorSetLayout(4);
   FKVStoreBundle := FCompute.CreateComputePipelineWithPush(
     FKVStoreShader, 'main', FKVStoreDescLayout, SizeOf(TVdxKVCacheStorePush));
@@ -544,19 +537,19 @@ begin
 
   // Batch matmul shaders + pipelines (Phase 6D — prefill batching)
   // Reuse FMatVecDescLayout (3 storage bindings: weight, input, output)
-  FMatMulF16Shader := LoadShader('matmul_f16.spv');
-  FMatMulQ8Shader := LoadShader('matmul_q8_0.spv');
+  FMatMulF16Shader := LoadShader('MATMUL_F16');
+  FMatMulQ8Shader := LoadShader('MATMUL_Q8_0');
   FMatMulF16Bundle := FCompute.CreateComputePipelineWithPush(
     FMatMulF16Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush));
   FMatMulQ8Bundle := FCompute.CreateComputePipelineWithPush(
     FMatMulQ8Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush));
 
   // --- Prefill attention shaders + pipelines (Phase 6D) ---
-  FRoPEBatchShader := LoadShader('rope_batch.spv');
-  FKVStoreBatchShader := LoadShader('kv_cache_store_batch.spv');
-  FScoresPrefillShader := LoadShader('attn_scores_prefill.spv');
-  FSoftmaxPrefillShader := LoadShader('softmax_prefill.spv');
-  FValuePrefillShader := LoadShader('attn_value_prefill.spv');
+  FRoPEBatchShader := LoadShader('ROPE_BATCH');
+  FKVStoreBatchShader := LoadShader('KV_CACHE_STORE_BATCH');
+  FScoresPrefillShader := LoadShader('ATTN_SCORES_PREFILL');
+  FSoftmaxPrefillShader := LoadShader('SOFTMAX_PREFILL');
+  FValuePrefillShader := LoadShader('ATTN_VALUE_PREFILL');
 
   // Reuse existing descriptor set layouts (same binding counts)
   FRoPEBatchBundle := FCompute.CreateComputePipelineWithPush(

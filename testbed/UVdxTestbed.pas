@@ -59,11 +59,12 @@ begin
   try
     LInference.SetStatusCallback(StatusCallback, nil);
     //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf');
-    LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-Q8_0.gguf');
+    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-Q8_0.gguf');
+    LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
     LInference.SetTokenCallback(PrintToken, nil);
-    LInference.Generate('What is the capital of France?');
+    //LInference.Generate('What is the capital of France?');
     //LInference.Generate('Who is bill gates?');
-    //LInference.Generate(CPrompt);
+    LInference.Generate(CPrompt);
     PrintStats(LInference.GetStats());
     LInference.UnloadModel();
   finally
