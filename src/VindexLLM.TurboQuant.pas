@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -58,7 +58,7 @@ type
     NumBlocks: UInt32;
   end;
 
-  { TVdxTQ3Block — packed block, 16 bytes (4 x uint32) }
+  { TVdxTQ3Block }
   TVdxTQ3Block = record
     QS0: UInt32;    // qs bytes [0..3]: elements 0-15, low 2 index bits
     QS1: UInt32;    // qs bytes [4..7]: elements 16-31, low 2 index bits
@@ -126,10 +126,7 @@ type
 
 implementation
 
-// ============================================================================
-//  FP16 <-> FP32 conversion helpers
-// ============================================================================
-
+{  FP16 <-> FP32 conversion helpers }
 function SingleToHalf(const AValue: Single): UInt32;
 var
   LBits: UInt32;
@@ -171,10 +168,8 @@ begin
   Result := PSingle(@LBits)^;
 end;
 
-// ============================================================================
-//  TVdxTurboQuant — Create / Destroy
-// ============================================================================
 
+{ TVdxTurboQuant }
 constructor TVdxTurboQuant.Create();
 begin
   inherited Create();
@@ -203,9 +198,6 @@ begin
   end;
   inherited Destroy();
 end;
-// ============================================================================
-//  TVdxTurboQuant — Init (create GPU pipelines)
-// ============================================================================
 
 procedure TVdxTurboQuant.Init(const ACompute: TVdxVulkanCompute);
 var
@@ -229,9 +221,6 @@ begin
   FDequantBundle := FCompute.CreateComputePipelineWithPush(
     FDequantShader, 'main', FDequantDescLayout, SizeOf(TVdxTQ3Push));
 end;
-// ============================================================================
-//  TVdxTurboQuant — GPU Quantize dispatch
-// ============================================================================
 
 procedure TVdxTurboQuant.Quantize(
   const AInputBuf: TVdxGpuBuffer;
@@ -249,9 +238,6 @@ begin
     FQuantBundle.Pipeline, FQuantBundle.PipelineLayout,
     ADescSet, @LPush, SizeOf(LPush), UInt32(ANumBlocks));
 end;
-// ============================================================================
-//  TVdxTurboQuant — GPU Dequantize dispatch
-// ============================================================================
 
 procedure TVdxTurboQuant.Dequantize(
   const AInputBuf: TVdxGpuBuffer;
@@ -269,9 +255,6 @@ begin
     FDequantBundle.Pipeline, FDequantBundle.PipelineLayout,
     ADescSet, @LPush, SizeOf(LPush), UInt32(ANumBlocks));
 end;
-// ============================================================================
-//  TVdxTurboQuant — CPU Reference: Quantize one block of 32 floats
-// ============================================================================
 
 class procedure TVdxTurboQuant.QuantizeBlockCPU(
   const AInput: PSingle;
@@ -363,10 +346,6 @@ begin
   AOutput.Gamma := SingleToHalf(LGamma);
 end;
 
-// ============================================================================
-//  TVdxTurboQuant — CPU Reference: Dequantize one block back to 32 floats
-// ============================================================================
-
 class procedure TVdxTurboQuant.DequantizeBlockCPU(
   const AInput: TVdxTQ3Block;
   const AOutput: PSingle);
@@ -428,10 +407,6 @@ begin
     PSingle(PByte(AOutput) + LI * SizeOf(Single))^ :=
       LTemp[LI] * CWHT_Norm * CTQ3Signs[LI];
 end;
-
-// ============================================================================
-//  TVdxTurboQuant — ComputeMSE: mean squared error between two float arrays
-// ============================================================================
 
 class function TVdxTurboQuant.ComputeMSE(
   const AA: PSingle;

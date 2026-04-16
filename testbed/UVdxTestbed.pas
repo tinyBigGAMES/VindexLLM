@@ -22,6 +22,7 @@ uses
   System.SysUtils,
   System.IOUtils,
   System.Math,
+  System.Generics.Collections,
   VindexLLM.Utils,
   VindexLLM.Vulkan,
   VindexLLM.Compute,
@@ -34,22 +35,123 @@ begin
   TVdxUtils.PrintLn(AText);
 end;
 
-function PrintToken(const AToken: string; const AUserData: Pointer): Boolean;
+procedure PrintErrors(const AInference: TVdxInference);
+var
+  LErrors: TVdxErrors;
+  LItems: TList<TVdxError>;
+  LI: Integer;
+  LErr: TVdxError;
+  LColor: string;
+  LLabel: string;
+begin
+  LErrors := AInference.GetErrors();
+  if LErrors = nil then
+    Exit;
+  LItems := LErrors.GetItems();
+  if LItems.Count = 0 then
+    Exit;
+
+  TVdxUtils.PrintLn('');
+  for LI := 0 to LItems.Count - 1 do
+  begin
+    LErr := LItems[LI];
+    case LErr.Severity of
+      esHint:
+      begin
+        LColor := COLOR_CYAN;
+        LLabel := 'HINT';
+      end;
+      esWarning:
+      begin
+        LColor := COLOR_YELLOW;
+        LLabel := 'WARN';
+      end;
+      esError:
+      begin
+        LColor := COLOR_RED;
+        LLabel := 'ERROR';
+      end;
+      esFatal:
+      begin
+        LColor := COLOR_MAGENTA;
+        LLabel := 'FATAL';
+      end;
+    else
+      LColor := COLOR_WHITE;
+      LLabel := '?';
+    end;
+
+    if LErr.Code <> '' then
+      TVdxUtils.PrintLn(LColor + '[%s] %s: %s', [LLabel, LErr.Code, LErr.Message])
+    else
+      TVdxUtils.PrintLn(LColor + '[%s] %s', [LLabel, LErr.Message]);
+  end;
+end;
+
+procedure InferenceEventCallback(const AEvent: TVdxInferenceEvent;
+  const AUserData: Pointer);
+begin
+  if AEVent = ieGenerateEnd then
+    TVdxUtils.PrintLn();
+
+  TVdxUtils.PrintLn(COLOR_GREEN + '[event] %s', [CVdxEventNames[AEvent]]);
+end;
+
+function CancelCallback(const AUserData: Pointer): Boolean;
+begin
+  Result := (GetAsyncKeyState(VK_ESCAPE) and $8000) <> 0;
+end;
+
+procedure PrintToken(const AToken: string; const AUserData: Pointer);
 begin
   Write(AToken);
-  Result := (GetAsyncKeyState(VK_ESCAPE) and $8000) = 0;
 end;
 
 procedure PrintStats(const AStats: PVdxInferenceStats);
+var
+  LStopColor: string;
 begin
   TVdxUtils.PrintLn();
-  TVdxUtils.PrintLn('Prefill:    %d tokens in %.0fms (%.1f tok/s)', [
-    AStats.PrefillTokens, AStats.PrefillTimeMs, AStats.PrefillTokPerSec]);
-  TVdxUtils.PrintLn('Generation: %d tokens in %.0fms (%.1f tok/s)', [
-    AStats.GeneratedTokens, AStats.GenerationTimeMs, AStats.GenerationTokPerSec]);
-  TVdxUtils.PrintLn('TTFT: %.0fms | Total: %.0fms | Stop: %s', [
-    AStats.TimeToFirstTokenMs, AStats.TotalTimeMs,
-    CVdxStopReasons[AStats.StopReason]]);
+
+  // Prefill line
+  TVdxUtils.Print(COLOR_WHITE + 'Prefill:    ');
+  TVdxUtils.Print(COLOR_CYAN + '%d tokens in %.0fms ', [
+    AStats.PrefillTokens, AStats.PrefillTimeMs]);
+  TVdxUtils.PrintLn(COLOR_GREEN + '(%.1f tok/s)', [AStats.PrefillTokPerSec]);
+
+  // Generation line
+  TVdxUtils.Print(COLOR_WHITE + 'Generation: ');
+  TVdxUtils.Print(COLOR_CYAN + '%d tokens in %.0fms ', [
+    AStats.GeneratedTokens, AStats.GenerationTimeMs]);
+  TVdxUtils.PrintLn(COLOR_GREEN + '(%.1f tok/s)', [AStats.GenerationTokPerSec]);
+
+  // Timing + stop reason
+  case AStats.StopReason of
+    srEOS,
+    srStopToken:   LStopColor := COLOR_GREEN;
+    srMaxTokens,
+    srContextFull: LStopColor := COLOR_YELLOW;
+    srCancelled:   LStopColor := COLOR_RED;
+  else
+    LStopColor := COLOR_WHITE;
+  end;
+  TVdxUtils.Print(COLOR_WHITE + 'TTFT: ');
+  TVdxUtils.Print(COLOR_CYAN + '%.0fms', [AStats.TimeToFirstTokenMs]);
+  TVdxUtils.Print(COLOR_WHITE + ' | Total: ');
+  TVdxUtils.Print(COLOR_CYAN + '%.0fms', [AStats.TotalTimeMs]);
+  TVdxUtils.Print(COLOR_WHITE + ' | Stop: ');
+  TVdxUtils.PrintLn(LStopColor + '%s', [CVdxStopReasons[AStats.StopReason]]);
+
+  // VRAM usage
+  TVdxUtils.Print(COLOR_WHITE + 'VRAM: ');
+  if AStats.VRAMUsage.TotalBytes > UInt64(10) * 1024 * 1024 * 1024 then
+    TVdxUtils.Print(COLOR_YELLOW + '%d MB ', [AStats.VRAMUsage.TotalBytes div (1024 * 1024)])
+  else
+    TVdxUtils.Print(COLOR_GREEN + '%d MB ', [AStats.VRAMUsage.TotalBytes div (1024 * 1024)]);
+  TVdxUtils.PrintLn(COLOR_CYAN + '(weights: %d, cache: %d, buffers: %d)', [
+    AStats.VRAMUsage.WeightsBytes div (1024 * 1024),
+    AStats.VRAMUsage.CacheBytes div (1024 * 1024),
+    AStats.VRAMUsage.BuffersBytes div (1024 * 1024)]);
 end;
 
 procedure Test01();
@@ -66,97 +168,38 @@ const
 var
   LInference: TVdxInference;
   LConfig: TVdxSamplerConfig;
+  LLoaded: Boolean;
 begin
-  TVdxUtils.Pause();
   LInference := TVdxInference.Create();
   try
     LInference.SetStatusCallback(StatusCallback, nil);
-    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.f16.gguf');
-    LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
     LInference.SetTokenCallback(PrintToken, nil);
+    LInference.SetInferenceEventCallback(InferenceEventCallback, nil);
+    LInference.SetCancelCallback(CancelCallback, nil);
 
-    LConfig := TVdxSampler.DefaultConfig();
-    LConfig.Temperature := 0.7;
-    LConfig.TopK := 40;
-    LConfig.Seed := 42;  // deterministic
-    LInference.SetSamplerConfig(LConfig);
+    LLoaded := LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
+    try
+      PrintErrors(LInference);
+      if not LLoaded then
+        Exit;
 
-    //LInference.Generate(CPrompt);
-    //LInference.Generate('how to make kno3?');
-    //LInference.Generate('what is the capital of france?');
-    LInference.Generate('who are you?');
-    PrintStats(LInference.GetStats());
-    LInference.UnloadModel();
-  finally
-    LInference.Free();
-  end;
-end;
+      // recommended sampling config for gemma-3-4b-it-null-space-abliterated
+      LConfig := TVdxSampler.DefaultConfig();
+      LConfig.Temperature := 1.0;
+      LConfig.TopK := 64;
+      LConfig.TopP := 0.95;
+      LConfig.RepeatPenalty := 1.2;
+      LConfig.RepeatWindow := 64;
+      LConfig.Seed := 0;  // 0 = random each run, >0 = reproducible output
+      LInference.SetSamplerConfig(LConfig);
 
-procedure Test02_Sampling();
-const
-  CModel = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf';
-  CPrompt = 'what is the capital of france?';
-var
-  LInference: TVdxInference;
-  LConfig: TVdxSamplerConfig;
-begin
-  TVdxUtils.Pause();
-  LInference := TVdxInference.Create();
-  try
-    LInference.SetStatusCallback(StatusCallback, nil);
-    LInference.LoadModel(CModel);
-    LInference.SetTokenCallback(PrintToken, nil);
+      LInference.Generate('create a short story about an AI', 1024);
+      PrintErrors(LInference);
+      PrintStats(LInference.GetStats());
 
-    // --- Run 1: Greedy (default) — must produce "Paris" ---
-    TVdxUtils.PrintLn('=== Run 1: Greedy (Temperature=0) ===');
-    LInference.SetSamplerConfig(TVdxSampler.DefaultConfig());
-    LInference.Generate(CPrompt, 32);
-    PrintStats(LInference.GetStats());
-    TVdxUtils.PrintLn('');
-
-    // --- Run 2: Sampling, Seed=42 ---
-    TVdxUtils.PrintLn('=== Run 2: Temp=0.7, TopK=40, Seed=42 ===');
-    LConfig := TVdxSampler.DefaultConfig();
-    LConfig.Temperature := 0.7;
-    LConfig.TopK := 40;
-    LConfig.Seed := 42;
-    LInference.SetSamplerConfig(LConfig);
-    LInference.Generate(CPrompt, 64);
-    PrintStats(LInference.GetStats());
-    TVdxUtils.PrintLn('');
-
-    // --- Run 3: Same seed — must match Run 2 ---
-    TVdxUtils.PrintLn('=== Run 3: Same config (determinism check) ===');
-    LInference.SetSamplerConfig(LConfig);
-    LInference.Generate(CPrompt, 64);
-    PrintStats(LInference.GetStats());
-    TVdxUtils.PrintLn('');
-
-    // --- Run 4: Full pipeline ---
-    TVdxUtils.PrintLn('=== Run 4: Temp=0.8, TopK=40, TopP=0.95, MinP=0.05, RepPen=1.2 ===');
-    LConfig := TVdxSampler.DefaultConfig();
-    LConfig.Temperature := 0.8;
-    LConfig.TopK := 40;
-    LConfig.TopP := 0.95;
-    LConfig.MinP := 0.05;
-    LConfig.RepeatPenalty := 1.2;
-    LConfig.RepeatWindow := 64;
-    LConfig.Seed := 42;
-    LInference.SetSamplerConfig(LConfig);
-    LInference.Generate(CPrompt, 128);
-    PrintStats(LInference.GetStats());
-    TVdxUtils.PrintLn('');
-
-    // --- Run 5: Greedy + repetition penalty ---
-    TVdxUtils.PrintLn('=== Run 5: Greedy + RepeatPenalty=1.2 ===');
-    LConfig := TVdxSampler.DefaultConfig();
-    LConfig.RepeatPenalty := 1.2;
-    LConfig.RepeatWindow := 64;
-    LInference.SetSamplerConfig(LConfig);
-    LInference.Generate(CPrompt, 64);
-    PrintStats(LInference.GetStats());
-
-    LInference.UnloadModel();
+      finally
+        LInference.UnloadModel();
+      end;
   finally
     LInference.Free();
   end;
@@ -167,11 +210,10 @@ var
   LIndex: Integer;
 begin
   try
-    LIndex := 2;
+    LIndex := 1;
 
     case LIndex of
       1: Test01();
-      2: Test02_Sampling();
     end;
   except
     on E: Exception do

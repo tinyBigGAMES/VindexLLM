@@ -71,8 +71,17 @@ type
     srEOS,               // End-of-sequence token
     srStopToken,         // User-defined stop token (e.g., <end_of_turn>)
     srMaxTokens,         // Reached max token limit
-    srCallbackStopped    // Token callback returned False
+    srContextFull,       // Context length exhausted during generation
+    srCancelled          // Cancel callback returned True
   );
+
+  { TVdxVRAMUsage }
+  TVdxVRAMUsage = record
+    WeightsBytes: UInt64;
+    CacheBytes: UInt64;
+    BuffersBytes: UInt64;
+    TotalBytes: UInt64;
+  end;
 
   { TVdxInferenceStats }
   TVdxInferenceStats = record
@@ -85,16 +94,38 @@ type
     TimeToFirstTokenMs: Double;
     TotalTimeMs: Double;
     StopReason: TVdxStopReason;
+    VRAMUsage: TVdxVRAMUsage;
   end;
   PVdxInferenceStats = ^TVdxInferenceStats;
 
   { TVdxTokenCallback }
-  TVdxTokenCallback = reference to function(
+  TVdxTokenCallback = reference to procedure(
     const AToken: string;
+    const AUserData: Pointer);
+
+  { TVdxInferenceEvent }
+  TVdxInferenceEvent = (
+    ieLoadStart,
+    ieLoadEnd,
+    ieUnloadStart,
+    ieUnloadEnd,
+    iePrefillStart,
+    iePrefillEnd,
+    ieGenerateStart,
+    ieGenerateEnd
+  );
+
+  { TVdxInferenceEventCallback }
+  TVdxInferenceEventCallback = reference to procedure(
+    const AEvent: TVdxInferenceEvent;
+    const AUserData: Pointer);
+
+  { TVdxCancelCallback }
+  TVdxCancelCallback = reference to function(
     const AUserData: Pointer): Boolean;
 
   { TVdxInference }
-  TVdxInference = class(TVdxStatusObject)
+  TVdxInference = class(TVdxErrorsObject)
   private
     // Subsystem objects
     FReader: TVdxGGUFReader;
@@ -107,6 +138,12 @@ type
 
     // Token callback
     FTokenCallback: TVdxCallback<TVdxTokenCallback>;
+
+    // Inference event callback
+    FEventCallback: TVdxCallback<TVdxInferenceEventCallback>;
+
+    // Cancel callback
+    FCancelCallback: TVdxCallback<TVdxCancelCallback>;
 
     // Model state
     FModelLoaded: Boolean;
@@ -213,6 +250,9 @@ type
     // Stats — filled by Generate()
     FStats: TVdxInferenceStats;
 
+    // VRAM usage — filled by LoadModel(), copied into FStats per Generate()
+    FVRAMUsage: TVdxVRAMUsage;
+
     // Private helpers
     //function F16ToF32(const AVal: UInt16): Single;
     function UploadNormWeight(const ATensorName: string;
@@ -226,14 +266,24 @@ type
     procedure RunLayerForwardBatch(const ALayer: Integer;
       const ANumTokens: UInt32);
     function RunUnembedding(): Integer;
+    procedure FireEvent(const AEvent: TVdxInferenceEvent);
+    function IsCancelled(): Boolean;
 
   public
     constructor Create(); override;
     destructor Destroy(); override;
 
-    procedure LoadModel(const AGGUFPath: string);
+    function LoadModel(const AGGUFPath: string;
+      const AMaxContext: Integer = 2048): Boolean;
 
     procedure SetTokenCallback(const ACallback: TVdxTokenCallback;
+      const AUserData: Pointer);
+
+    procedure SetInferenceEventCallback(
+      const ACallback: TVdxInferenceEventCallback;
+      const AUserData: Pointer);
+
+    procedure SetCancelCallback(const ACallback: TVdxCancelCallback;
       const AUserData: Pointer);
 
     function Generate(const APrompt: string;
@@ -253,7 +303,15 @@ type
 const
   { CVdxStopReasons }
   CVdxStopReasons: array[TVdxStopReason] of string = (
-    'none', 'eos', 'stop_token', 'max_tokens', 'callback_stopped');
+    'none', 'eos', 'stop_token', 'max_tokens', 'context_full', 'cancelled');
+
+  { CVdxEventNames }
+  CVdxEventNames: array[TVdxInferenceEvent] of string = (
+    'load start', 'load end',
+    'unload start', 'unload end',
+    'prefill start', 'prefill end',
+    'generate start', 'generate end'
+  );
 
 implementation
 
@@ -262,6 +320,7 @@ constructor TVdxInference.Create();
 begin
   inherited;
 
+  FErrors := TVdxErrors.Create();
   FReader := nil;
   FCompute := nil;
   FNorm := nil;
@@ -282,6 +341,7 @@ begin
     UnloadModel();
 
   FreeAndNil(FStopTokenIds);
+  FreeAndNil(FErrors);
 
   inherited;
 end;
@@ -354,9 +414,14 @@ begin
   LPtr := FReader.GetTensorDataPtr(ATensorName);
   LSize := VdxGGMLTensorBytes(LInfo.TensorType,
     LInfo.Dimensions[0], LInfo.Dimensions[1]);
-  TVdxUtils.FailIf(LSize = 0,
-    'Unsupported tensor type for %s: %s',
-    [ATensorName, VdxGGMLTypeName(LInfo.TensorType)]);
+  if LSize = 0 then
+  begin
+    FErrors.Add(esFatal, 'LOAD',
+      'Unsupported tensor type for %s: %s',
+      [ATensorName, VdxGGMLTypeName(LInfo.TensorType)]);
+    FillChar(Result, SizeOf(Result), 0);
+    Exit;
+  end;
 
   LStaging := FCompute.CreateGpuBuffer(LSize,
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -646,7 +711,20 @@ begin
   Result := FSampler.Process(System.PSingle(FLogitsVBuf.Memory), FVocabSize);
 end;
 
-procedure TVdxInference.LoadModel(const AGGUFPath: string);
+procedure TVdxInference.FireEvent(const AEvent: TVdxInferenceEvent);
+begin
+  if FEventCallback.IsAssigned() then
+    FEventCallback.Callback(AEvent, FEventCallback.UserData);
+end;
+
+function TVdxInference.IsCancelled(): Boolean;
+begin
+  Result := FCancelCallback.IsAssigned() and
+    FCancelCallback.Callback(FCancelCallback.UserData);
+end;
+
+function TVdxInference.LoadModel(const AGGUFPath: string;
+  const AMaxContext: Integer): Boolean;
 var
   LLayer: Integer;
   LBufSize: UInt64;
@@ -654,9 +732,22 @@ var
   LQInfo: TVdxGGUFTensorInfo;
   LProbeIds: TArray<Integer>;
   LProbeIdx: Integer;
+  LModelMax: UInt32;
+  LKVPerLayer: UInt64;
+  LKVTotal: UInt64;
+  LVramWeights: UInt64;
+  LVramCache: UInt64;
+  LVramBuffers: UInt64;
 begin
-  TVdxUtils.FailIf(FModelLoaded,
-    'Model already loaded — call UnloadModel() first', []);
+  Result := False;
+  FErrors.Clear();
+  FireEvent(ieLoadStart);
+
+  if FModelLoaded then
+  begin
+    FErrors.Add(esFatal, 'LOAD', 'Model already loaded — call UnloadModel() first');
+    Exit;
+  end;
 
   // Create subsystem objects
   FReader := TVdxGGUFReader.Create();
@@ -673,13 +764,26 @@ begin
   FNorm.SetStatusCallback(FStatusCallback.Callback, FStatusCallback.UserData);
 
   // --- Open GGUF and read model config ---
-  Status('Opening GGUF: %s', [AGGUFPath]);
-  TVdxUtils.FailIf(not FReader.Open(AGGUFPath),
-    'Failed to open GGUF: %s', [AGGUFPath]);
+  if not FReader.Open(AGGUFPath) then
+  begin
+    FErrors.Add(esFatal, 'LOAD', 'Failed to open GGUF: %s', [AGGUFPath]);
+    Exit;
+  end;
 
   // Detect architecture and read model dimensions from GGUF metadata
   FArchitecture := TVdxChatTemplate.DetectArchitecture(FReader);
   Status('Architecture: %s', [FArchitecture]);
+
+  // Validate architecture (only gemma3 forward pass implemented currently)
+  if FArchitecture <> 'gemma3' then
+  begin
+    FErrors.Add(esFatal, 'ARCH',
+      'Unsupported model architecture: "%s". ' +
+      'VindexLLM currently implements the gemma3 forward pass only. ' +
+      'Other architectures require different layer structures.',
+      [FArchitecture]);
+    Exit;
+  end;
 
   FNumLayers := FReader.GetMetadataUInt32(FArchitecture + '.block_count');
   FHiddenDim := FReader.GetMetadataUInt32(FArchitecture + '.embedding_length');
@@ -690,7 +794,25 @@ begin
   // Derive head_dim from Q weight tensor shape
   LQInfo := FReader.GetTensorInfo('blk.0.attn_q.weight');
   FHeadDim := UInt32(LQInfo.Dimensions[1]) div FNumQHeads;
-  FMaxSeqLen := 2048;
+
+  // Configurable context length: clamp user request to model's native max
+  if FReader.HasMetadata(FArchitecture + '.context_length') then
+    LModelMax := FReader.GetMetadataUInt32(FArchitecture + '.context_length')
+  else
+    LModelMax := 8192;
+  FMaxSeqLen := Min(UInt32(AMaxContext), LModelMax);
+  Status('Context length: %d (model max: %d)', [FMaxSeqLen, LModelMax]);
+
+  // KV cache memory estimate
+  LKVPerLayer := UInt64(2) * FMaxSeqLen * FNumKVHeads * FHeadDim * SizeOf(Single);
+  LKVTotal := UInt64(FNumLayers) * LKVPerLayer;
+  Status('KV cache estimate: %d MB (%d layers x %d ctx)',
+    [LKVTotal div (1024 * 1024), FNumLayers, FMaxSeqLen]);
+
+  // Init VRAM usage accumulators
+  LVramWeights := 0;
+  LVramCache := LKVTotal;
+  LVramBuffers := 0;
 
   // Detect weight tensor type (F16, Q4_0, etc.) from first layer's Q weight
   FWeightType := LQInfo.TensorType;
@@ -708,8 +830,11 @@ begin
   FNorm.Init(FCompute);
   FAttn.Init(FCompute, FHiddenDim, FNumQHeads, FNumKVHeads,
     FHeadDim, FNumLayers, FMaxSeqLen);
-  TVdxUtils.FailIf(not FVindex.BuildFromGGUF(FReader),
-    'Failed to build vindex', []);
+  if not FVindex.BuildFromGGUF(FReader) then
+  begin
+    FErrors.Add(esFatal, 'LOAD', 'Failed to build FFN weight index from GGUF');
+    Exit;
+  end;
 
   // Create work buffers
   LBufSize := UInt64(FHiddenDim) * SizeOf(Single);
@@ -813,9 +938,16 @@ begin
   // Output norm (global, not per-layer)
   FOutputNormGpu := UploadNormWeight('output_norm.weight', FHiddenDim);
 
+  // Bail if any weight upload failed
+  if FErrors.HasFatal() then
+    Exit;
+
   // --- Load tokenizer ---
-  TVdxUtils.FailIf(not FTokenizer.LoadFromGGUF(FReader),
-    'Failed to load tokenizer from GGUF', []);
+  if not FTokenizer.LoadFromGGUF(FReader) then
+  begin
+    FErrors.Add(esFatal, 'LOAD', 'Failed to load tokenizer from GGUF');
+    Exit;
+  end;
   FVocabSize := FTokenizer.GetVocabSize();
   Status('Tokenizer loaded: %d tokens, BOS=%d, EOS=%d',
     [FVocabSize, FTokenizer.GetBosId(), FTokenizer.GetEosId()]);
@@ -855,11 +987,18 @@ begin
 
   // --- Get embedding table pointer (mmap'd data) ---
   FEmbedPtr := PByte(FReader.GetTensorDataPtr('token_embd.weight'));
-  TVdxUtils.FailIf(FEmbedPtr = nil,
-    'token_embd.weight not found in GGUF', []);
-  TVdxUtils.FailIf((FEmbedType <> gtF16) and (FEmbedType <> gtF32) and (FEmbedType <> gtQ8_0),
-    'Unsupported embedding type: %s (need F16, F32, or Q8_0)',
-    [VdxGGMLTypeName(FEmbedType)]);
+  if FEmbedPtr = nil then
+  begin
+    FErrors.Add(esFatal, 'LOAD', 'token_embd.weight not found in GGUF');
+    Exit;
+  end;
+  if (FEmbedType <> gtF16) and (FEmbedType <> gtF32) and (FEmbedType <> gtQ8_0) then
+  begin
+    FErrors.Add(esFatal, 'LOAD',
+      'Unsupported embedding type: %s (need F16, F32, or Q8_0)',
+      [VdxGGMLTypeName(FEmbedType)]);
+    Exit;
+  end;
   FEmbedScale := Sqrt(Single(FHiddenDim));
 
   // Upload embedding table to GPU for fast unembedding
@@ -985,7 +1124,45 @@ begin
   // --- Allocate CPU embedding scratch array ---
   SetLength(FResidual, FHiddenDim);
 
+  // --- VRAM usage summary (computed from model dimensions) ---
+  // Weights: gate + down + up + Q + K + V + O + norms + embed table
+  LVramWeights :=
+    UInt64(FNumLayers) * VdxGGMLTensorBytes(FWeightType, FHiddenDim, FFFNWidth) +         // gate
+    UInt64(FNumLayers) * VdxGGMLTensorBytes(FWeightType, FFFNWidth, FHiddenDim) +         // down
+    UInt64(FNumLayers) * VdxGGMLTensorBytes(FWeightType, FHiddenDim, FFFNWidth) +         // up
+    UInt64(FNumLayers) * VdxGGMLTensorBytes(FWeightType, FHiddenDim, FNumQHeads * FHeadDim) +  // Q
+    UInt64(FNumLayers) * VdxGGMLTensorBytes(FWeightType, FHiddenDim, FNumKVHeads * FHeadDim) + // K
+    UInt64(FNumLayers) * VdxGGMLTensorBytes(FWeightType, FHiddenDim, FNumKVHeads * FHeadDim) + // V
+    UInt64(FNumLayers) * VdxGGMLTensorBytes(FWeightType, FNumQHeads * FHeadDim, FHiddenDim) +  // O
+    UInt64(FNumLayers) * (4 * FHiddenDim + 2 * FHeadDim) * SizeOf(Single) +              // layer norms
+    UInt64(FHiddenDim) * SizeOf(Single) +                                                 // output norm
+    VdxGGMLTensorBytes(FEmbedType, FHiddenDim, UInt64(FVocabSize));                       // embed table
+
+  // Buffers: work vectors + prefill matrices + logits + token IDs
+  LVramBuffers :=
+    UInt64(4) * FHiddenDim * SizeOf(Single) +                                             // residual, work, attn_out, ffn_out
+    UInt64(2) * FFFNWidth * SizeOf(Single) +                                              // gate, up
+    UInt64(4) * FMaxSeqLen * FHiddenDim * SizeOf(Single) +                                // residual/work/attnout/ffnout mats
+    UInt64(FMaxSeqLen) * FNumQHeads * FHeadDim * SizeOf(Single) +                         // Q mat
+    UInt64(2) * FMaxSeqLen * FNumKVHeads * FHeadDim * SizeOf(Single) +                    // K/V mats
+    UInt64(2) * FMaxSeqLen * FFFNWidth * SizeOf(Single) +                                 // gate/up mats
+    UInt64(FVocabSize) * SizeOf(Single) +                                                 // logits
+    UInt64(FMaxSeqLen) * SizeOf(UInt32);                                                  // token IDs
+
+  // Cache already computed as LKVTotal
+  FVRAMUsage.WeightsBytes := LVramWeights;
+  FVRAMUsage.CacheBytes := LKVTotal;
+  FVRAMUsage.BuffersBytes := LVramBuffers;
+  FVRAMUsage.TotalBytes := LVramWeights + LKVTotal + LVramBuffers;
+  Status('VRAM usage: %d MB (weights: %d, cache: %d, buffers: %d)',
+    [FVRAMUsage.TotalBytes div (1024 * 1024),
+     LVramWeights div (1024 * 1024),
+     LKVTotal div (1024 * 1024),
+     LVramBuffers div (1024 * 1024)]);
+
   FModelLoaded := True;
+  Result := True;
+  FireEvent(ieLoadEnd);
   Status('Model loaded successfully');
 end;
 
@@ -994,6 +1171,21 @@ procedure TVdxInference.SetTokenCallback(const ACallback: TVdxTokenCallback;
 begin
   FTokenCallback.Callback := ACallback;
   FTokenCallback.UserData := AUserData;
+end;
+
+procedure TVdxInference.SetInferenceEventCallback(
+  const ACallback: TVdxInferenceEventCallback;
+  const AUserData: Pointer);
+begin
+  FEventCallback.Callback := ACallback;
+  FEventCallback.UserData := AUserData;
+end;
+
+procedure TVdxInference.SetCancelCallback(const ACallback: TVdxCancelCallback;
+  const AUserData: Pointer);
+begin
+  FCancelCallback.Callback := ACallback;
+  FCancelCallback.UserData := AUserData;
 end;
 
 procedure TVdxInference.SetSamplerConfig(const AConfig: TVdxSamplerConfig);
@@ -1036,11 +1228,18 @@ var
   LPrefillWatch: TStopwatch;
   LGenWatch: TStopwatch;
 begin
-  TVdxUtils.FailIf(not FModelLoaded, 'Model not loaded', []);
+  Result := '';
+  FErrors.Clear();
 
-  // Reset stats
-  FillChar(FStats, SizeOf(FStats), 0);
-  FStats.StopReason := srNone;
+  if not FModelLoaded then
+  begin
+    FErrors.Add(esError, 'GEN', 'Model not loaded');
+    Exit;
+  end;
+
+  // Reset stats (preserve VRAM usage from LoadModel)
+  FStats := Default(TVdxInferenceStats);
+  FStats.VRAMUsage := FVRAMUsage;
 
   // Format prompt with chat template
   LFormatted := TVdxChatTemplate.FormatPrompt(FArchitecture, APrompt);
@@ -1049,18 +1248,35 @@ begin
   LTokenIds := FTokenizer.Encode(LFormatted, True);
   LTokenCount := Length(LTokenIds);
 
+  // Guard: prompt must fit within context window
+  if LTokenCount > Integer(FMaxSeqLen) then
+  begin
+    FErrors.Add(esError, 'GEN',
+      'Prompt too long: %d tokens exceeds max context %d',
+      [LTokenCount, FMaxSeqLen]);
+    Exit;
+  end;
+
   LTotalWatch := TStopwatch.StartNew();
   LResult := TStringBuilder.Create();
   try
     // Reset sampler history for this generation
     FSampler.ResetHistory();
     // --- Prefill: batch all prompt tokens through the model (Phase 6D) ---
+    FireEvent(iePrefillStart);
     LPrefillWatch := TStopwatch.StartNew();
 
     FCompute.BeginBatch();
     EmbedTokensBatch(LTokenIds, LTokenCount, FResidualMat);
     for LLayer := 0 to Integer(FNumLayers) - 1 do
+    begin
+      if IsCancelled() then
+      begin
+        FStats.StopReason := srCancelled;
+        Break;
+      end;
       RunLayerForwardBatch(LLayer, UInt32(LTokenCount));
+    end;
     FCompute.EndBatch();
 
     // Copy last token's residual from matrix to vector for generation handoff
@@ -1071,12 +1287,33 @@ begin
       UInt64(FHiddenDim) * SizeOf(Single));
 
     LPrefillWatch.Stop();
+    FireEvent(iePrefillEnd);
 
     // --- Autoregressive generation ---
-    LGenWatch := TStopwatch.StartNew();
     LGenerated := 0;
-    while LGenerated < AMaxTokens do
+    FillChar(LGenWatch, SizeOf(LGenWatch), 0); // safe default if skipped
+
+    // Skip generation if cancelled during prefill
+    if FStats.StopReason <> srCancelled then
     begin
+      FireEvent(ieGenerateStart);
+      LGenWatch := TStopwatch.StartNew();
+      while LGenerated < AMaxTokens do
+    begin
+      // Check context overflow
+      if UInt32(LTokenCount + LGenerated) >= FMaxSeqLen then
+      begin
+        FStats.StopReason := srContextFull;
+        Break;
+      end;
+
+      // Check cancel before unembedding
+      if IsCancelled() then
+      begin
+        FStats.StopReason := srCancelled;
+        Break;
+      end;
+
       LNextTokenId := RunUnembedding();
 
       // Check for stop tokens
@@ -1097,16 +1334,9 @@ begin
       // Track token for repetition penalty
       FSampler.AddToHistory(LNextTokenId);
 
-      // Call token callback if assigned
+      // Notify token callback if assigned
       if FTokenCallback.IsAssigned() then
-      begin
-        if not FTokenCallback.Callback(LTokenStr, FTokenCallback.UserData) then
-        begin
-          FStats.StopReason := srCallbackStopped;
-          Inc(LGenerated);
-          Break;
-        end;
-      end;
+        FTokenCallback.Callback(LTokenStr, FTokenCallback.UserData);
 
       // Feed predicted token back into the model
       Inc(LGenerated);
@@ -1114,10 +1344,23 @@ begin
       FCompute.BeginBatch();
       EmbedToken(LNextTokenId);
       for LLayer := 0 to Integer(FNumLayers) - 1 do
+      begin
+        if IsCancelled() then
+        begin
+          FStats.StopReason := srCancelled;
+          Break;
+        end;
         RunLayerForward(LLayer, LTokenCount + LGenerated - 1);
+      end;
       FCompute.EndBatch();
+
+      // Break outer loop if cancelled during forward pass
+      if FStats.StopReason = srCancelled then
+        Break;
     end;
     LGenWatch.Stop();
+    FireEvent(ieGenerateEnd);
+    end; // if not cancelled during prefill
 
     // Max tokens reached without a stop token
     if FStats.StopReason = srNone then
@@ -1151,6 +1394,8 @@ var
 begin
   if not FModelLoaded then
     Exit;
+
+  FireEvent(ieUnloadStart);
 
   // Free GELU-mul pipeline
   FCompute.DestroyDescriptorPoolHandle(FGeluMulDescPool);
@@ -1252,6 +1497,7 @@ begin
   FEmbedPtr := nil;
   FModelLoaded := False;
 
+  FireEvent(ieUnloadEnd);
   Status('Model unloaded');
 end;
 
