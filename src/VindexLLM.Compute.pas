@@ -154,6 +154,7 @@ type
     procedure DestroyShaderModuleHandle(const AModule: VkShaderModule);
     function  CreateComputePipelineSimple(const AShaderModule: VkShaderModule; const AEntryPoint: PAnsiChar; const ADescSetLayout: VkDescriptorSetLayout): TVdxComputePipelineBundle;
     function  CreateComputePipelineWithPush(const AShaderModule: VkShaderModule; const AEntryPoint: PAnsiChar; const ADescSetLayout: VkDescriptorSetLayout; const APushSize: UInt32): TVdxComputePipelineBundle;
+    function  CreateComputePipelineWithPushAndSpec(const AShaderModule: VkShaderModule; const AEntryPoint: PAnsiChar; const ADescSetLayout: VkDescriptorSetLayout; const APushSize: UInt32; const ASpecValue: UInt32): TVdxComputePipelineBundle;
     procedure DestroyComputePipelineBundle(var ABundle: TVdxComputePipelineBundle);
 
     // Descriptor sets
@@ -662,6 +663,65 @@ begin
 
   // Compute pipeline
   FillChar(LPipelineInfo, SizeOf(LPipelineInfo), 0);
+  LPipelineInfo.sType := VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  LPipelineInfo.stage := LStageInfo;
+  LPipelineInfo.layout := Result.PipelineLayout;
+  CheckVk(FvkCreateComputePipelines(FDevice, VK_NULL_HANDLE, 1, LPipelineInfo, nil, @Result.Pipeline), 'vkCreateComputePipelines');
+end;
+
+function TVdxVulkanCompute.CreateComputePipelineWithPushAndSpec(
+  const AShaderModule: VkShaderModule;
+  const AEntryPoint: PAnsiChar;
+  const ADescSetLayout: VkDescriptorSetLayout;
+  const APushSize: UInt32;
+  const ASpecValue: UInt32): TVdxComputePipelineBundle;
+var
+  LPushRange: VkPushConstantRange;
+  LLayoutInfo: VkPipelineLayoutCreateInfo;
+  LStageInfo: VkPipelineShaderStageCreateInfo;
+  LPipelineInfo: VkComputePipelineCreateInfo;
+  LSpecEntry: VkSpecializationMapEntry;
+  LSpecInfo: VkSpecializationInfo;
+begin
+  Result := Default(TVdxComputePipelineBundle);
+
+  // Specialization constant: single UInt32 at constant_id = 0
+  LSpecEntry := Default(VkSpecializationMapEntry);
+  LSpecEntry.constantID := 0;
+  LSpecEntry.offset := 0;
+  LSpecEntry.size := SizeOf(UInt32);
+
+  LSpecInfo := Default(VkSpecializationInfo);
+  LSpecInfo.mapEntryCount := 1;
+  LSpecInfo.pMapEntries := @LSpecEntry;
+  LSpecInfo.dataSize := SizeOf(UInt32);
+  LSpecInfo.pData := @ASpecValue;
+
+  // Push constant range for compute stage
+  LPushRange := Default(VkPushConstantRange);
+  LPushRange.stageFlags := VK_SHADER_STAGE_COMPUTE_BIT;
+  LPushRange.offset := 0;
+  LPushRange.size := APushSize;
+
+  // Pipeline layout with push constants
+  LLayoutInfo := Default(VkPipelineLayoutCreateInfo);
+  LLayoutInfo.sType := VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  LLayoutInfo.setLayoutCount := 1;
+  LLayoutInfo.pSetLayouts := @ADescSetLayout;
+  LLayoutInfo.pushConstantRangeCount := 1;
+  LLayoutInfo.pPushConstantRanges := @LPushRange;
+  CheckVk(FvkCreatePipelineLayout(FDevice, LLayoutInfo, nil, Result.PipelineLayout), 'vkCreatePipelineLayout');
+
+  // Shader stage with specialization constant
+  LStageInfo := Default(VkPipelineShaderStageCreateInfo);
+  LStageInfo.sType := VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  LStageInfo.stage := VK_SHADER_STAGE_COMPUTE_BIT;
+  LStageInfo.module := AShaderModule;
+  LStageInfo.pName := AEntryPoint;
+  LStageInfo.pSpecializationInfo := @LSpecInfo;
+
+  // Compute pipeline
+  LPipelineInfo := Default(VkComputePipelineCreateInfo);
   LPipelineInfo.sType := VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   LPipelineInfo.stage := LStageInfo;
   LPipelineInfo.layout := Result.PipelineLayout;

@@ -4,18 +4,18 @@
 
 // MatMul Q8_0 (Tiled): Q8_0 weight matrix x F32 input matrix -> F32 output matrix
 //
-// Computes: Y[tok][row] = dot(dequant(W[row]), X[tok]) for all (row, tok) pairs
+// Computes: Y[tok][row] = dot(dequant(W[row]), X[tok]) for all (row, tok) pairs.
 // This is the batched version of matvec_q8_0.comp for prefill.
-//
-// Key optimizations (same as matvec_q8_0):
-//   1. Shared-memory scale cache — each block's F16 scale decoded once
-//   2. Per-element striding preserves accumulation order
-//   3. Direct int8 reads via 8-bit storage extension
 //
 // Q8_0 block format (34 bytes, 32 elements):
 //   bytes 0-1:  f16 scale factor
 //   bytes 2-33: 32 int8 quantized values
 //   dequant: value = int8_val * scale
+//
+// Block scales are cooperatively loaded into shared memory (Phase 1),
+// then reused during the per-element dot product (Phase 2). The shared
+// array size is set via specialization constant at pipeline creation,
+// so it always matches the model's actual blocks_per_row — no overflow.
 //
 // Input layout: row-major F32 [num_tokens x in_dim]
 // Output layout: row-major F32 [num_tokens x out_dim]
@@ -28,8 +28,10 @@
 //   0 = weight data   (int8_t[], raw Q8_0 blocks, row-major)
 //   1 = input matrix  (float[], num_tokens x in_dim, row-major)
 //   2 = output matrix (float[], num_tokens x out_dim, row-major)
-
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Specialization constant: set at pipeline creation to actual blocks_per_row
+layout(constant_id = 0) const uint MAX_BLOCKS = 256;
 
 layout(push_constant) uniform PushConstants {
     uint in_dim;        // input dimension (must be multiple of 32)
@@ -49,10 +51,9 @@ layout(std430, binding = 2) writeonly buffer OutputBuf {
     float output_mat[];
 };
 
-// Scale cache + reduction scratch (256 + 256 = 512 floats = 2KB)
-shared float blk_scales[256];   // blocks_per_row (80 for dim=2560)
+// Scale cache + reduction scratch
+shared float blk_scales[MAX_BLOCKS];
 shared float partial[256];
-
 void main() {
     uint row = gl_WorkGroupID.x;
     uint tok = gl_WorkGroupID.y;
@@ -61,15 +62,15 @@ void main() {
     if (row >= pc.out_dim || tok >= pc.num_tokens)
         return;
 
-    uint blocks_per_row = pc.in_dim >> 5;  // in_dim / 32
-    uint row_byte_off = row * blocks_per_row * 34;
-    uint input_base = tok * pc.in_dim;
+    uint blocks_per_row = pc.in_dim >> 5;
+    uint row_byte_off   = row * blocks_per_row * 34u;
+    uint input_base     = tok * pc.in_dim;
 
     // === Phase 1: Cooperatively load all block scales into shared memory ===
     for (uint b = tid; b < blocks_per_row; b += 256) {
-        uint off = row_byte_off + b * 34;
-        uint lo = uint(weight_bytes[off]) & 0xFF;
-        uint hi = uint(weight_bytes[off + 1]) & 0xFF;
+        uint off = row_byte_off + b * 34u;
+        uint lo  = uint(weight_bytes[off]) & 0xFFu;
+        uint hi  = uint(weight_bytes[off + 1u]) & 0xFFu;
         blk_scales[b] = unpackHalf2x16(lo | (hi << 8)).x;
     }
     barrier();
@@ -78,15 +79,14 @@ void main() {
     float acc = 0.0;
 
     for (uint elem = tid; elem < pc.in_dim; elem += 256) {
-        uint blk_idx = elem >> 5;           // elem / 32
-        float qval = float(weight_bytes[row_byte_off + blk_idx * 34 + 2 + (elem & 31)]);
+        uint blk_idx = elem >> 5;
+        float qval   = float(weight_bytes[row_byte_off + blk_idx * 34u + 2u + (elem & 31u)]);
         acc += qval * blk_scales[blk_idx] * input_mat[input_base + elem];
     }
 
     partial[tid] = acc;
     barrier();
 
-    // Parallel reduction in shared memory
     for (uint stride = 128; stride > 0; stride >>= 1) {
         if (tid < stride) {
             partial[tid] += partial[tid + stride];
