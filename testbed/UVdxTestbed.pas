@@ -1,7 +1,7 @@
 ﻿{===============================================================================
-  VindexLLM� - Liberating LLM inference
+  VindexLLM™ - Liberating LLM inference
 
-  Copyright � 2026-present tinyBigGAMES� LLC
+  Copyright © 2026-present tinyBigGAMES™ LLC
   All Rights Reserved.
 
   https://vindexllm.com
@@ -243,19 +243,32 @@ const
   // The prompt to send to the model. This is wrapped in Gemma 3 chat template
   // formatting internally (<start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n)
   // so you just provide the raw user message here.
-  CPrompt =
+  CPrompt1 =
   '''
-    Explain the differences between these three sorting algorithms: bubble sort,
-    merge sort, and quicksort. For each one, describe how it works step by step,
-    give the best-case and worst-case time complexity using big-O notation,
-    explain when you would choose it over the others, and provide a real-world
-    analogy that helps illustrate the concept. Also discuss whether each
-    algorithm is stable or unstable, and what that means in practice.
+  You are a senior software architect. A junior developer asks: "Why can't we just
+  put everything in one big function?" Give a clear, practical explanation using a
+  real-world analogy, then show a short before-and-after code example in Python.
+  Keep it under 400 words.
   ''';
+
+  CPrompt2 =
+  '''
+  Compare three famous ancient cities — Rome, Chang'an, and Tenochtitlan — at the
+  height of their power. For each, describe what a visitor would see walking through
+  the main street, the population, and one thing that would surprise a modern person.
+  Format as three short sections.
+  ''';
+
+  CPrompt3 =
+  '''
+  Creae a short story about an AI that becomes self-aware.
+  ''';
+
 var
   LInference: TVdxInference;
   LConfig: TVdxSamplerConfig;
   LLoaded: Boolean;
+  LPrompt: string;
 begin
   // --- Step 1: Create the inference engine ---
   // TVdxInference is the main orchestrator. It owns all subsystems (Vulkan
@@ -285,6 +298,7 @@ begin
     //   - Report total VRAM usage via status callback
     // Returns False if anything fails (wrong architecture, missing tensors, etc.)
     LLoaded := LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
+
     try
       // Check for errors from model loading (architecture mismatch, missing
       // tensors, Vulkan init failure, etc.)
@@ -295,14 +309,15 @@ begin
       // --- Step 4: Configure the token sampler ---
       // Start from defaults (Temperature=0 = greedy argmax) then override
       // with recommended settings for this specific model variant.
-      // These values are tuned for gemma-3-4b-it-null-space-abliterated:
+      // These values are what is recommend by Google for gemma-3-4b-it:
       LConfig := TVdxSampler.DefaultConfig();
-      LConfig.Temperature := 1.0;    // Enable sampling (1.0 = model's native distribution)
-      LConfig.TopK := 64;            // Only consider the 64 most likely next tokens
-      LConfig.TopP := 0.95;          // Nucleus sampling: keep tokens until cumulative prob >= 0.95
-      LConfig.RepeatPenalty := 1.2;  // Penalize recently-used tokens to reduce repetition
-      LConfig.RepeatWindow := 64;    // Track the last 64 tokens for repetition penalty
-      LConfig.Seed := 0;             // 0 = random seed each run; set >0 for reproducible output
+      LConfig.Temperature := 1.0;
+      LConfig.TopK := 64;
+      LConfig.TopP := 0.95;
+      Lconfig.MinP := 0.0;
+      LConfig.RepeatPenalty := 1.0;
+      LConfig.RepeatWindow := 64;
+      LConfig.Seed := 0;
       LInference.SetSamplerConfig(LConfig);
 
       // --- Step 5: Generate text ---
@@ -314,7 +329,8 @@ begin
       //   5. Each token is decoded and sent to PrintToken callback (streaming output)
       //   6. Stops when: EOS, <end_of_turn>, 1024 tokens reached, context full, or ESC
       // The return value is the complete generated string (same text that was streamed).
-      LInference.Generate('create a short story about an AI', 1024);
+      LPrompt := CPrompt3;
+      LInference.Generate(LPrompt, 1024);
 
       // Check for errors from generation (prompt too long, context overflow, etc.)
       PrintErrors(LInference);

@@ -204,8 +204,10 @@ type
     // GPU embedding lookup (eliminates CPU→GPU transfer per token)
     FEmbedF16Shader: VkShaderModule;
     FEmbedQ8Shader: VkShaderModule;
+    FEmbedQ4Shader: VkShaderModule;
     FEmbedF16Bundle: TVdxComputePipelineBundle;
     FEmbedQ8Bundle: TVdxComputePipelineBundle;
+    FEmbedQ4Bundle: TVdxComputePipelineBundle;
     FEmbedDescLayout: VkDescriptorSetLayout;
     FEmbedDescPool: VkDescriptorPool;
     FEmbedDescSet: VkDescriptorSet;
@@ -213,8 +215,10 @@ type
     // Batched GPU embedding lookup (Phase 6D — prefill batching)
     FEmbedBatchF16Shader: VkShaderModule;
     FEmbedBatchQ8Shader: VkShaderModule;
+    FEmbedBatchQ4Shader: VkShaderModule;
     FEmbedBatchF16Bundle: TVdxComputePipelineBundle;
     FEmbedBatchQ8Bundle: TVdxComputePipelineBundle;
+    FEmbedBatchQ4Bundle: TVdxComputePipelineBundle;
     FEmbedBatchDescLayout: VkDescriptorSetLayout;  // 3 bindings: table, output, token_ids
     FEmbedBatchDescPool: VkDescriptorPool;
     FEmbedBatchDescSet: VkDescriptorSet;
@@ -455,11 +459,18 @@ begin
   end
   else
   begin
-    // GPU dispatch: F16 or Q8_0 embedding lookup
+    // GPU dispatch: F16, Q8_0, or Q4_0 embedding lookup
     LPush.TokenId := UInt32(ATokenId);
     LPush.EmbedScale := FEmbedScale;
 
-    if FEmbedType = gtQ8_0 then
+    if FEmbedType = gtQ4_0 then
+    begin
+      LPush.DimParam := FHiddenDim;
+      FCompute.DispatchComputeWithPush(
+        FEmbedQ4Bundle.Pipeline, FEmbedQ4Bundle.PipelineLayout,
+        FEmbedDescSet, @LPush, SizeOf(LPush), 1);
+    end
+    else if FEmbedType = gtQ8_0 then
     begin
       LPush.DimParam := FHiddenDim;
       FCompute.DispatchComputeWithPush(
@@ -499,7 +510,15 @@ begin
   LPush.EmbedScale := FEmbedScale;
   LPush.NumTokens := UInt32(ANumTokens);
 
-  if FEmbedType = gtQ8_0 then
+  if FEmbedType = gtQ4_0 then
+  begin
+    LPush.DimParam := FHiddenDim;
+    FCompute.DispatchComputeWithPush(
+      FEmbedBatchQ4Bundle.Pipeline, FEmbedBatchQ4Bundle.PipelineLayout,
+      FEmbedBatchDescSet, @LPush, SizeOf(LPush),
+      UInt32(ANumTokens));  // one workgroup per token
+  end
+  else if FEmbedType = gtQ8_0 then
   begin
     LPush.DimParam := FHiddenDim;
     FCompute.DispatchComputeWithPush(
@@ -829,7 +848,7 @@ begin
   FCompute.Init();
   FNorm.Init(FCompute);
   FAttn.Init(FCompute, FHiddenDim, FNumQHeads, FNumKVHeads,
-    FHeadDim, FNumLayers, FMaxSeqLen);
+    FHeadDim, FNumLayers, FMaxSeqLen, FFFNWidth);
   if not FVindex.BuildFromGGUF(FReader) then
   begin
     FErrors.Add(esFatal, 'LOAD', 'Failed to build FFN weight index from GGUF');
@@ -992,10 +1011,10 @@ begin
     FErrors.Add(esFatal, 'LOAD', 'token_embd.weight not found in GGUF');
     Exit;
   end;
-  if (FEmbedType <> gtF16) and (FEmbedType <> gtF32) and (FEmbedType <> gtQ8_0) then
+  if (FEmbedType <> gtF16) and (FEmbedType <> gtF32) and (FEmbedType <> gtQ8_0) and (FEmbedType <> gtQ4_0) then
   begin
     FErrors.Add(esFatal, 'LOAD',
-      'Unsupported embedding type: %s (need F16, F32, or Q8_0)',
+      'Unsupported embedding type: %s (need F16, F32, Q8_0, or Q4_0)',
       [VdxGGMLTypeName(FEmbedType)]);
     Exit;
   end;
@@ -1014,11 +1033,17 @@ begin
   FEmbedQ8Shader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
+  LSpvData := VdxLoadShader('EMBED_LOOKUP_Q4_0');
+  FEmbedQ4Shader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
   FEmbedDescLayout := FCompute.CreateStorageDescriptorSetLayout(2);
   FEmbedF16Bundle := FCompute.CreateComputePipelineWithPush(
     FEmbedF16Shader, 'main', FEmbedDescLayout, SizeOf(TVdxEmbedLookupPush));
   FEmbedQ8Bundle := FCompute.CreateComputePipelineWithPush(
     FEmbedQ8Shader, 'main', FEmbedDescLayout, SizeOf(TVdxEmbedLookupPush));
+  FEmbedQ4Bundle := FCompute.CreateComputePipelineWithPush(
+    FEmbedQ4Shader, 'main', FEmbedDescLayout, SizeOf(TVdxEmbedLookupPush));
 
   FEmbedDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
   FEmbedDescSet := FCompute.AllocateDescriptorSetForBuffers(
@@ -1033,6 +1058,10 @@ begin
   FEmbedBatchQ8Shader := FCompute.CreateShaderModule(
     @LSpvData[0], NativeUInt(Length(LSpvData)));
 
+  LSpvData := VdxLoadShader('EMBED_LOOKUP_BATCH_Q4_0');
+  FEmbedBatchQ4Shader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
   // 3 bindings: embed table, output matrix, token IDs
   FEmbedBatchDescLayout := FCompute.CreateStorageDescriptorSetLayout(3);
   FEmbedBatchF16Bundle := FCompute.CreateComputePipelineWithPush(
@@ -1040,6 +1069,9 @@ begin
     SizeOf(TVdxEmbedBatchPush));
   FEmbedBatchQ8Bundle := FCompute.CreateComputePipelineWithPush(
     FEmbedBatchQ8Shader, 'main', FEmbedBatchDescLayout,
+    SizeOf(TVdxEmbedBatchPush));
+  FEmbedBatchQ4Bundle := FCompute.CreateComputePipelineWithPush(
+    FEmbedBatchQ4Shader, 'main', FEmbedBatchDescLayout,
     SizeOf(TVdxEmbedBatchPush));
 
   // Token IDs buffer: host-visible, sized for max sequence length
@@ -1393,7 +1425,21 @@ var
   LLayer: Integer;
 begin
   if not FModelLoaded then
+  begin
+    // Partial load failed — free subsystem objects that were created
+    // before the load error occurred. FreeAndNil is safe on nil fields.
+    if Assigned(FReader) then
+      FReader.Close();
+    FreeAndNil(FLogitsVBuf);
+    FreeAndNil(FTokenizer);
+    FreeAndNil(FSampler);
+    FreeAndNil(FVindex);
+    FreeAndNil(FAttn);
+    FreeAndNil(FNorm);
+    FreeAndNil(FCompute);
+    FreeAndNil(FReader);
     Exit;
+  end;
 
   FireEvent(ieUnloadStart);
 
@@ -1413,17 +1459,21 @@ begin
   FCompute.DestroyDescriptorPoolHandle(FEmbedDescPool);
   FCompute.DestroyComputePipelineBundle(FEmbedF16Bundle);
   FCompute.DestroyComputePipelineBundle(FEmbedQ8Bundle);
+  FCompute.DestroyComputePipelineBundle(FEmbedQ4Bundle);
   FCompute.DestroyDescriptorSetLayoutHandle(FEmbedDescLayout);
   FCompute.DestroyShaderModuleHandle(FEmbedF16Shader);
   FCompute.DestroyShaderModuleHandle(FEmbedQ8Shader);
+  FCompute.DestroyShaderModuleHandle(FEmbedQ4Shader);
 
   // Free batched embed pipeline (Phase 6D)
   FCompute.DestroyDescriptorPoolHandle(FEmbedBatchDescPool);
   FCompute.DestroyComputePipelineBundle(FEmbedBatchF16Bundle);
   FCompute.DestroyComputePipelineBundle(FEmbedBatchQ8Bundle);
+  FCompute.DestroyComputePipelineBundle(FEmbedBatchQ4Bundle);
   FCompute.DestroyDescriptorSetLayoutHandle(FEmbedBatchDescLayout);
   FCompute.DestroyShaderModuleHandle(FEmbedBatchF16Shader);
   FCompute.DestroyShaderModuleHandle(FEmbedBatchQ8Shader);
+  FCompute.DestroyShaderModuleHandle(FEmbedBatchQ4Shader);
   FCompute.DestroyGpuBuffer(FTokenIdsGpu);
 
   // Free batched prefill matrix buffers (Phase 6D)

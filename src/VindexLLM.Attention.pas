@@ -182,6 +182,7 @@ type
     // Shader modules
     FMatVecShader: VkShaderModule;
     FMatVecQ8Shader: VkShaderModule;
+    FMatVecQ4Shader: VkShaderModule;
     FQKNormShader: VkShaderModule;
     FRoPEShader: VkShaderModule;
     FAttnScoresMHShader: VkShaderModule;
@@ -190,6 +191,7 @@ type
     // Pipeline bundles
     FMatVecBundle: TVdxComputePipelineBundle;
     FMatVecQ8Bundle: TVdxComputePipelineBundle;
+    FMatVecQ4Bundle: TVdxComputePipelineBundle;
     FQKNormBundle: TVdxComputePipelineBundle;
     FRoPEBundle: TVdxComputePipelineBundle;
     FAttnScoresMHBundle: TVdxComputePipelineBundle;
@@ -223,8 +225,10 @@ type
     // Batch matmul shaders + pipelines (prefill batching — Phase 6D)
     FMatMulF16Shader: VkShaderModule;
     FMatMulQ8Shader: VkShaderModule;
+    FMatMulQ4Shader: VkShaderModule;
     FMatMulF16Bundle: TVdxComputePipelineBundle;
     FMatMulQ8Bundle: TVdxComputePipelineBundle;
+    FMatMulQ4Bundle: TVdxComputePipelineBundle;
 
     // Prefill attention shaders + pipelines (Phase 6D)
     FRoPEBatchShader: VkShaderModule;
@@ -311,7 +315,8 @@ type
     procedure Init(const ACompute: TVdxVulkanCompute;
       const AHiddenDim: UInt32; const ANumQHeads: UInt32;
       const ANumKVHeads: UInt32; const AHeadDim: UInt32;
-      const ANumLayers: UInt32; const AMaxSeqLen: UInt32);
+      const ANumLayers: UInt32; const AMaxSeqLen: UInt32;
+      const AFFNWidth: UInt32);
 
     // Release all GPU resources
     procedure Cleanup();
@@ -389,6 +394,7 @@ begin
   FCompute := nil;
   FMatVecShader := VK_NULL_HANDLE;
   FMatVecQ8Shader := VK_NULL_HANDLE;
+  FMatVecQ4Shader := VK_NULL_HANDLE;
   FQKNormShader := VK_NULL_HANDLE;
   FRoPEShader := VK_NULL_HANDLE;
   FAttnScoresMHShader := VK_NULL_HANDLE;
@@ -397,6 +403,7 @@ begin
 
   FMatVecBundle.Pipeline := VK_NULL_HANDLE;
   FMatVecQ8Bundle.Pipeline := VK_NULL_HANDLE;
+  FMatVecQ4Bundle.Pipeline := VK_NULL_HANDLE;
   FQKNormBundle.Pipeline := VK_NULL_HANDLE;
   FRoPEBundle.Pipeline := VK_NULL_HANDLE;
   FAttnScoresMHBundle.Pipeline := VK_NULL_HANDLE;
@@ -421,10 +428,13 @@ begin
 
   FMatMulF16Shader := VK_NULL_HANDLE;
   FMatMulQ8Shader := VK_NULL_HANDLE;
+  FMatMulQ4Shader := VK_NULL_HANDLE;
   FMatMulF16Bundle.Pipeline := VK_NULL_HANDLE;
   FMatMulF16Bundle.PipelineLayout := VK_NULL_HANDLE;
   FMatMulQ8Bundle.Pipeline := VK_NULL_HANDLE;
   FMatMulQ8Bundle.PipelineLayout := VK_NULL_HANDLE;
+  FMatMulQ4Bundle.Pipeline := VK_NULL_HANDLE;
+  FMatMulQ4Bundle.PipelineLayout := VK_NULL_HANDLE;
 
   FRoPEBatchShader := VK_NULL_HANDLE;
   FKVStoreBatchShader := VK_NULL_HANDLE;
@@ -479,11 +489,13 @@ end;
 procedure TVdxAttention.Init(const ACompute: TVdxVulkanCompute;
   const AHiddenDim: UInt32; const ANumQHeads: UInt32;
   const ANumKVHeads: UInt32; const AHeadDim: UInt32;
-  const ANumLayers: UInt32; const AMaxSeqLen: UInt32);
+  const ANumLayers: UInt32; const AMaxSeqLen: UInt32;
+  const AFFNWidth: UInt32);
 var
   LI: Integer;
   LCacheSize: UInt64;
   LDummyBuf: TVdxGpuBuffer;
+  LMaxQ8Blocks: UInt32;
 begin
   FCompute := ACompute;
   FHiddenDim := AHiddenDim;
@@ -493,9 +505,14 @@ begin
   FNumLayers := ANumLayers;
   FMaxSeqLen := AMaxSeqLen;
 
+  // Max Q8_0 blocks per row across all matvec uses (attention + FFN).
+  // FFN-down has the largest in_dim (AFFNWidth), so it determines the ceiling.
+  LMaxQ8Blocks := AFFNWidth div 32;
+
   // Load all shaders
   FMatVecShader := LoadShader('MATVEC_F16');
   FMatVecQ8Shader := LoadShader('MATVEC_Q8_0');
+  FMatVecQ4Shader := LoadShader('MATVEC_Q4_0');
   FQKNormShader := LoadShader('QK_NORM');
   FRoPEShader := LoadShader('ROPE');
   FAttnScoresMHShader := LoadShader('ATTN_SCORES_MH');
@@ -512,8 +529,11 @@ begin
   // Create pipelines with push constants
   FMatVecBundle := FCompute.CreateComputePipelineWithPush(
     FMatVecShader, 'main', FMatVecDescLayout, SizeOf(TVdxMatVecF16Push));
-  FMatVecQ8Bundle := FCompute.CreateComputePipelineWithPush(
-    FMatVecQ8Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatVecF16Push));
+  FMatVecQ8Bundle := FCompute.CreateComputePipelineWithPushAndSpec(
+    FMatVecQ8Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatVecF16Push),
+    LMaxQ8Blocks);
+  FMatVecQ4Bundle := FCompute.CreateComputePipelineWithPush(
+    FMatVecQ4Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatVecF16Push));
   FQKNormBundle := FCompute.CreateComputePipelineWithPush(
     FQKNormShader, 'main', FQKNormDescLayout, SizeOf(TVdxQKNormPush));
   FRoPEBundle := FCompute.CreateComputePipelineWithPush(
@@ -627,10 +647,14 @@ begin
   // Reuse FMatVecDescLayout (3 storage bindings: weight, input, output)
   FMatMulF16Shader := LoadShader('MATMUL_F16');
   FMatMulQ8Shader := LoadShader('MATMUL_Q8_0');
+  FMatMulQ4Shader := LoadShader('MATMUL_Q4_0');
   FMatMulF16Bundle := FCompute.CreateComputePipelineWithPush(
     FMatMulF16Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush));
-  FMatMulQ8Bundle := FCompute.CreateComputePipelineWithPush(
-    FMatMulQ8Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush));
+  FMatMulQ8Bundle := FCompute.CreateComputePipelineWithPushAndSpec(
+    FMatMulQ8Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush),
+    LMaxQ8Blocks);
+  FMatMulQ4Bundle := FCompute.CreateComputePipelineWithPush(
+    FMatMulQ4Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush));
 
   // --- Prefill attention shaders + pipelines (Phase 6D) ---
   FRoPEBatchShader := LoadShader('ROPE_BATCH');
@@ -751,6 +775,7 @@ begin
   // Destroy pipelines
   FCompute.DestroyComputePipelineBundle(FMatVecBundle);
   FCompute.DestroyComputePipelineBundle(FMatVecQ8Bundle);
+  FCompute.DestroyComputePipelineBundle(FMatVecQ4Bundle);
   FCompute.DestroyComputePipelineBundle(FQKNormBundle);
   FCompute.DestroyComputePipelineBundle(FRoPEBundle);
   FCompute.DestroyComputePipelineBundle(FAttnScoresMHBundle);
@@ -767,8 +792,10 @@ begin
   // Destroy batch matmul pipelines + shaders (Phase 6D)
   FCompute.DestroyComputePipelineBundle(FMatMulF16Bundle);
   FCompute.DestroyComputePipelineBundle(FMatMulQ8Bundle);
+  FCompute.DestroyComputePipelineBundle(FMatMulQ4Bundle);
   FCompute.DestroyShaderModuleHandle(FMatMulF16Shader);
   FCompute.DestroyShaderModuleHandle(FMatMulQ8Shader);
+  FCompute.DestroyShaderModuleHandle(FMatMulQ4Shader);
 
   // Destroy prefill attention resources (Phase 6D)
   if FPrefillScoresBuf.Buffer <> VK_NULL_HANDLE then
@@ -801,6 +828,7 @@ begin
   // Destroy shader modules
   FCompute.DestroyShaderModuleHandle(FMatVecShader);
   FCompute.DestroyShaderModuleHandle(FMatVecQ8Shader);
+  FCompute.DestroyShaderModuleHandle(FMatVecQ4Shader);
   FCompute.DestroyShaderModuleHandle(FQKNormShader);
   FCompute.DestroyShaderModuleHandle(FRoPEShader);
   FCompute.DestroyShaderModuleHandle(FAttnScoresMHShader);
@@ -850,8 +878,14 @@ begin
   FCompute.UpdateDescriptorSetBuffers(FMatVecDescSet,
     [AWeightBuf, AInputBuf, AOutputBuf]);
 
-  // Select pipeline: Q8_0 uses full in_dim, F16 uses in_dim/2
-  if ATensorType = gtQ8_0 then
+  // Select pipeline: Q4_0 and Q8_0 use full in_dim, F16 uses in_dim/2
+  if ATensorType = gtQ4_0 then
+  begin
+    LPush.InDimHalf := AInDim;
+    LPipeline := FMatVecQ4Bundle.Pipeline;
+    LPipelineLayout := FMatVecQ4Bundle.PipelineLayout;
+  end
+  else if ATensorType = gtQ8_0 then
   begin
     LPush.InDimHalf := AInDim;
     LPipeline := FMatVecQ8Bundle.Pipeline;
@@ -900,7 +934,13 @@ begin
     [AWeightBuf, AInputBuf, AOutputBuf]);
 
   // Select pipeline and set dimension parameter
-  if ATensorType = gtQ8_0 then
+  if ATensorType = gtQ4_0 then
+  begin
+    LPush.InDimParam := AInDim;
+    LPipeline := FMatMulQ4Bundle.Pipeline;
+    LPipelineLayout := FMatMulQ4Bundle.PipelineLayout;
+  end
+  else if ATensorType = gtQ8_0 then
   begin
     LPush.InDimParam := AInDim;
     LPipeline := FMatMulQ8Bundle.Pipeline;
