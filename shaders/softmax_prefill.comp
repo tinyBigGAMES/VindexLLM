@@ -1,27 +1,40 @@
 #version 450
 
-// Prefill Softmax: normalize attention scores for all (head, query_pos) pairs.
-// Each workgroup processes one (head, query_pos) slice of NumTokens keys.
-// Causal mask is already applied (masked positions are -1e30).
+// Prefill Softmax: normalize attention scores for all (head, query_pos)
+// pairs. Each workgroup processes one (head, query_pos) row of SeqLen keys
+// within a MaxSeq-strided row. Causal mask is already applied by the scores
+// shader (masked positions hold -1e30).
 //
-// Scores layout: [NumQHeads x NumTokens x NumTokens]
-//   slice(head, qpos) at offset: head * N * N + qpos * N
+// Scores layout: [NumQHeads x NumTokens x MaxSeq]  (row stride = MaxSeq)
+//   slice(head, qpos) at offset: head * NumTokens * MaxSeq + qpos * MaxSeq
+//   Valid columns: [0, SeqLen). Columns [SeqLen, MaxSeq) are undefined and
+//   MUST NOT be read — they may hold uninitialized garbage from the
+//   previous dispatch.
 //
 // Dispatch 2D: (NumQHeads, NumTokens) — one workgroup per (head, query_pos)
-//   X = query head, Y = query position
+//   X = query head, Y = query position in batch
 //
 // Bindings:
 //   0 = scores (float[], read/write in-place)
 //
 // Push constants:
-//   num_tokens  = keys per slice (and stride between query rows)
+//   num_tokens  = Q rows in this batch (drives Y dispatch)
 //   num_q_heads = number of query heads
+//   max_seq     = row stride in the scores buffer
+//   seq_len     = actual number of keys per row (start_pos + num_tokens).
+//                 Loops walk this many columns, never MaxSeq.
+//   start_pos   = absolute position of first Q token in this batch.
+//                 Causal upper bound for this row is start_pos + q_pos + 1;
+//                 enforced defensively alongside the scores-shader mask.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConstants {
     uint num_tokens;
     uint num_q_heads;
+    uint max_seq;
+    uint seq_len;
+    uint start_pos;
 } pc;
 
 layout(std430, binding = 0) buffer ScoresBuf {
@@ -38,12 +51,21 @@ void main() {
     if (head >= pc.num_q_heads || q_pos >= pc.num_tokens)
         return;
 
-    uint N = pc.num_tokens;
-    uint base = head * N * N + q_pos * N;
+    // Row base: scores are [NumQHeads x NumTokens x MaxSeq], stride MaxSeq.
+    uint base = head * pc.num_tokens * pc.max_seq + q_pos * pc.max_seq;
+
+    // Causal upper bound (exclusive) for this query row. Row length is
+    // clamped to min(seq_len, start_pos + q_pos + 1) so we never read
+    // columns beyond the causal horizon, even if the scores shader ever
+    // stops pre-masking future keys.
+    uint q_abs = pc.start_pos + q_pos;
+    uint row_len = q_abs + 1;
+    if (row_len > pc.seq_len)
+        row_len = pc.seq_len;
 
     // Phase 1: Find max (parallel reduction)
     float local_max = -1.0e30;
-    for (uint i = tid; i < N; i += 256) {
+    for (uint i = tid; i < row_len; i += 256) {
         local_max = max(local_max, scores[base + i]);
     }
     shared_data[tid] = local_max;
@@ -59,7 +81,7 @@ void main() {
 
     // Phase 2: Compute exp(x - max) in-place and sum
     float local_sum = 0.0;
-    for (uint i = tid; i < N; i += 256) {
+    for (uint i = tid; i < row_len; i += 256) {
         float e = exp(scores[base + i] - max_val);
         scores[base + i] = e;
         local_sum += e;
@@ -77,7 +99,7 @@ void main() {
 
     // Phase 3: Normalize
     float inv_sum = 1.0 / total_sum;
-    for (uint i = tid; i < N; i += 256) {
+    for (uint i = tid; i < row_len; i += 256) {
         scores[base + i] *= inv_sum;
     }
 }

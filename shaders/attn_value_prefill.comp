@@ -1,16 +1,20 @@
 #version 450
 
-// Prefill Attention Value: weighted sum of V cache for all (head, query_pos).
+// Prefill Attention Value: weighted sum of V cache for all
+// (head, query_pos_in_batch).
 //
 // output[q_pos][q_head][d] =
-//   sum over k: scores[q_head][q_pos][k] * v_cache[kv_head][k][d]
+//   sum over k in [0, start_pos + q_pos_in_batch]:
+//     scores[q_head][q_pos][k] * v_cache[kv_head][k][d]
 //
-// Scores layout: [NumQHeads x NumTokens x NumTokens]
+// Scores layout:  [NumQHeads x NumTokens x MaxSeq]  (row stride = MaxSeq)
+//   Only columns [0, SeqLen) are valid per row; the causal weights past
+//   start_pos + q_pos are zero anyway (masked then softmaxed to 0).
 // V cache layout: [NumKVHeads x MaxSeq x HeadDim]
-// Output layout: [NumTokens x NumQHeads x HeadDim]
+// Output layout:  [NumTokens x NumQHeads x HeadDim]
 //
 // Dispatch 3D: (ceil(HeadDim / 256), NumQHeads, NumTokens)
-//   X = dimension, Y = query head, Z = query position
+//   X = dimension, Y = query head, Z = query position in batch
 //
 // Bindings:
 //   0 = scores  (float[], attention weights after softmax)
@@ -18,7 +22,12 @@
 //   2 = output  (float[], NumTokens x NumQHeads x HeadDim)
 //
 // Push constants:
-//   head_dim, num_tokens, max_seq, num_q_heads, gqa_ratio
+//   head_dim, num_tokens, max_seq, num_q_heads, gqa_ratio,
+//   start_pos, seq_len
+//
+// NOTE: seq_len is kept in this push block for record symmetry with the
+// scores and softmax prefill shaders. It is not read here — the V-sum
+// upper bound is the causal limit (start_pos + q_pos), always <= seq_len.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -28,6 +37,8 @@ layout(push_constant) uniform PushConstants {
     uint max_seq;
     uint num_q_heads;
     uint gqa_ratio;
+    uint start_pos;
+    uint seq_len;
 } pc;
 
 layout(std430, binding = 0) readonly buffer ScoresBuf {
@@ -50,14 +61,19 @@ void main() {
     if (d >= pc.head_dim || q_head >= pc.num_q_heads || q_pos >= pc.num_tokens)
         return;
 
-    uint N = pc.num_tokens;
     uint kv_head = q_head / pc.gqa_ratio;
-    uint score_base = q_head * N * N + q_pos * N;
+
+    // Row stride is max_seq — scores buffer is [NumQHeads x NumTokens x MaxSeq].
+    uint score_base = q_head * pc.num_tokens * pc.max_seq + q_pos * pc.max_seq;
+
     uint v_off = kv_head * pc.max_seq * pc.head_dim;
     uint out_idx = (q_pos * pc.num_q_heads + q_head) * pc.head_dim + d;
 
+    // Sum up to and including this query's absolute position.
+    uint k_last = pc.start_pos + q_pos;
+
     float acc = 0.0;
-    for (uint k = 0; k <= q_pos; k++) {
+    for (uint k = 0; k <= k_last; k++) {
         acc += scores[score_base + k] * v_cache[v_off + k * pc.head_dim + d];
     }
 

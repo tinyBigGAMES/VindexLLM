@@ -148,12 +148,17 @@ type
     Scale: Single;
     NumQHeads: UInt32;
     GqaRatio: UInt32;
+    StartPos: UInt32;
+    SeqLen: UInt32;
   end;
 
   { TVdxSoftmaxPrefillPush }
   TVdxSoftmaxPrefillPush = record
     NumTokens: UInt32;
     NumQHeads: UInt32;
+    MaxSeq: UInt32;
+    SeqLen: UInt32;
+    StartPos: UInt32;
   end;
 
   { TVdxAttnValuePrefillPush }
@@ -163,6 +168,8 @@ type
     MaxSeq: UInt32;
     NumQHeads: UInt32;
     GqaRatio: UInt32;
+    StartPos: UInt32;
+    SeqLen: UInt32;
   end;
 
   { TVdxAttnLayerWeights }
@@ -357,6 +364,9 @@ type
     // Batched attention for prefill: processes all N tokens through one layer.
     // QMat/KMat/VMat: pre-normed projections [NumTokens x Dim], already allocated.
     // AAttnOutMat: output [NumTokens x HiddenDim], caller adds to residual.
+    // AStartPos: absolute KV slot at which to begin writing this batch.
+    //   For a fresh prefill, pass 0. For continuation after a loaded KV
+    //   cache, pass the saved position.
     // Must be called inside an active batch (BeginBatch/EndBatch).
     procedure ForwardBatch(const AInputMat: TVdxGpuBuffer;
       const AWeights: TVdxAttnLayerWeights;
@@ -364,6 +374,7 @@ type
       const AKNormBuf: TVdxGpuBuffer;
       const ALayerIndex: Integer;
       const ANumTokens: UInt32;
+      const AStartPos: UInt32;
       const AThetaBase: Single;
       const AQMat: TVdxGpuBuffer;
       const AKMat: TVdxGpuBuffer;
@@ -378,6 +389,16 @@ type
     property AttnOutBufInternal: TVdxGpuBuffer read FAttnOutBuf;
     function GetKCache(const ALayerIndex: Integer): TVdxGpuBuffer;
     function GetVCache(const ALayerIndex: Integer): TVdxGpuBuffer;
+
+    // TQ3-compressed KV cache accessors (for save/load and diagnostics).
+    // Returns the per-layer persistent cache buffer, NOT the shared decode
+    // buffer that GetKCache/GetVCache return.
+    function GetLayerKCacheTQ3(const ALayerIndex: Integer): TVdxGpuBuffer;
+    function GetLayerVCacheTQ3(const ALayerIndex: Integer): TVdxGpuBuffer;
+
+    // Byte size of one K or V layer's TQ3 cache buffer. Identical for K
+    // and V (same shape), identical across all layers.
+    function GetLayerKVCacheTQ3Bytes(): UInt64;
   end;
 
 implementation
@@ -978,19 +999,27 @@ procedure TVdxAttention.ForwardBatch(const AInputMat: TVdxGpuBuffer;
   const AKNormBuf: TVdxGpuBuffer;
   const ALayerIndex: Integer;
   const ANumTokens: UInt32;
+  const AStartPos: UInt32;
   const AThetaBase: Single;
   const AQMat: TVdxGpuBuffer;
   const AKMat: TVdxGpuBuffer;
   const AVMat: TVdxGpuBuffer;
   const AAttnOutMat: TVdxGpuBuffer);
 var
+  LSeqLen: UInt32;
   LQKNormPush: TVdxQKNormPush;
   LRoPEPush: TVdxRoPEBatchPush;
   LKVStoreTQ3Push: TVdxKVStoreBatchTQ3Push;
+  LTQ3DequantPush: TVdxTQ3KVDequantPush;
   LScoresPush: TVdxAttnScoresPrefillPush;
   LSoftmaxPush: TVdxSoftmaxPrefillPush;
   LValuePush: TVdxAttnValuePrefillPush;
 begin
+  // Total keys in the filled cache after this batch writes its tokens.
+  // Prefill dispatches and shader indexing must cover this range, not
+  // just the current batch's own tokens.
+  LSeqLen := AStartPos + ANumTokens;
+
   // ---- Step 1: Q/K/V projections (batch matmul) ----
   DispatchBatchMatMul(AWeights.QWeightGpu, AInputMat, AQMat,
     FHiddenDim, FNumQHeads * FHeadDim, ANumTokens, AWeights.WeightType);
@@ -1020,10 +1049,10 @@ begin
     FNumKVHeads * ANumTokens);
   FCompute.BatchBarrier(); // Q/K normed
 
-  // ---- Step 3: Batched RoPE (per-token positions 0..N-1) ----
+  // ---- Step 3: Batched RoPE (per-token positions start_pos..start_pos+N-1) ----
   LRoPEPush.HeadDim := FHeadDim;
   LRoPEPush.ThetaBase := AThetaBase;
-  LRoPEPush.StartPos := 0;
+  LRoPEPush.StartPos := AStartPos;
 
   // RoPE on Q: dispatch 2D (NumQHeads, NumTokens)
   LRoPEPush.NumHeads := FNumQHeads;
@@ -1048,7 +1077,7 @@ begin
   LKVStoreTQ3Push.MaxSeq := FMaxSeqLen;
   LKVStoreTQ3Push.NumHeads := FNumKVHeads;
   LKVStoreTQ3Push.NumTokens := ANumTokens;
-  LKVStoreTQ3Push.StartPos := 0;
+  LKVStoreTQ3Push.StartPos := AStartPos;
 
   // Fused K: projection → decode buffer + TQ3 cache
   FCompute.UpdateDescriptorSetBuffers(FKVStoreBatchTQ3DescSet,
@@ -1067,26 +1096,71 @@ begin
     (FHeadDim div 32) * FNumKVHeads, ANumTokens);
   FCompute.BatchBarrier(); // Decode buffers + TQ3 caches ready
 
+  // ---- Step 4.5: Dequantize full cache range for continuation prefill ----
+  //
+  // When AStartPos > 0 the decode buffers only hold this batch's keys and
+  // values at positions [AStartPos .. AStartPos + ANumTokens). Positions
+  // [0 .. AStartPos) hold leftover junk from the previous call's last
+  // layer. The prefill scores and value shaders read from FKDecodeF32 /
+  // FVDecodeF32 over the full SeqLen range, so we must populate them from
+  // the persistent per-layer TQ3 caches before attention runs.
+  //
+  // When AStartPos = 0 the decode buffers are already populated correctly
+  // by the Step 4 store, straight from the live projections (no TQ3 round-
+  // trip). Skipping the dequant here preserves bit-exact behavior for
+  // single-call (fresh-session) prefill.
+  if AStartPos > 0 then
+  begin
+    LTQ3DequantPush.BlocksPerHead := FHeadDim div 32;
+    LTQ3DequantPush.MaxSeq := FMaxSeqLen;
+    LTQ3DequantPush.SeqLen := LSeqLen;
+    LTQ3DequantPush.NumHeads := FNumKVHeads;
+
+    // K dequant: FKCacheTQ3[layer] → FKDecodeF32, full [0, SeqLen) range
+    FCompute.UpdateDescriptorSetBuffers(FTQ3KVDequantDescSet,
+      [FKCacheTQ3[ALayerIndex], FKDecodeF32]);
+    FCompute.DispatchComputeWithPush(
+      FTQ3KVDequantBundle.Pipeline, FTQ3KVDequantBundle.PipelineLayout,
+      FTQ3KVDequantDescSet, @LTQ3DequantPush, SizeOf(LTQ3DequantPush),
+      (FHeadDim div 32) * FNumKVHeads * LSeqLen);
+
+    // V dequant: FVCacheTQ3[layer] → FVDecodeF32, full [0, SeqLen) range
+    FCompute.UpdateDescriptorSetBuffers(FTQ3KVDequantDescSet,
+      [FVCacheTQ3[ALayerIndex], FVDecodeF32]);
+    FCompute.DispatchComputeWithPush(
+      FTQ3KVDequantBundle.Pipeline, FTQ3KVDequantBundle.PipelineLayout,
+      FTQ3KVDequantDescSet, @LTQ3DequantPush, SizeOf(LTQ3DequantPush),
+      (FHeadDim div 32) * FNumKVHeads * LSeqLen);
+    FCompute.BatchBarrier(); // Decode buffers hold full [0, SeqLen) range
+  end;
+
   // ---- Step 5: Prefill attention (scores + softmax + value) ----
 
   // 5a. Causal attention scores: 3D dispatch (keys, heads, queries)
+  //   X dimension must cover SeqLen keys, not NumTokens — every new query
+  //   token attends over the full filled cache (start_pos + num_tokens).
   LScoresPush.HeadDim := FHeadDim;
   LScoresPush.NumTokens := ANumTokens;
   LScoresPush.MaxSeq := FMaxSeqLen;
   LScoresPush.Scale := 1.0 / Sqrt(Single(FHeadDim));
   LScoresPush.NumQHeads := FNumQHeads;
   LScoresPush.GqaRatio := FNumQHeads div FNumKVHeads;
+  LScoresPush.StartPos := AStartPos;
+  LScoresPush.SeqLen := LSeqLen;
   FCompute.UpdateDescriptorSetBuffers(FPrefillScoresDescSet,
     [AQMat, FKDecodeF32, FPrefillScoresBuf]);
   FCompute.DispatchComputeWithPush(
     FScoresPrefillBundle.Pipeline, FScoresPrefillBundle.PipelineLayout,
     FPrefillScoresDescSet, @LScoresPush, SizeOf(LScoresPush),
-    (ANumTokens + 255) div 256, FNumQHeads, ANumTokens);
+    (LSeqLen + 255) div 256, FNumQHeads, ANumTokens);
   FCompute.BatchBarrier(); // Scores ready for softmax
 
   // 5b. Softmax: 2D dispatch (heads, queries)
   LSoftmaxPush.NumTokens := ANumTokens;
   LSoftmaxPush.NumQHeads := FNumQHeads;
+  LSoftmaxPush.MaxSeq := FMaxSeqLen;
+  LSoftmaxPush.SeqLen := LSeqLen;
+  LSoftmaxPush.StartPos := AStartPos;
   FCompute.UpdateDescriptorSetBuffers(FPrefillSoftmaxDescSet,
     [FPrefillScoresBuf]);
   FCompute.DispatchComputeWithPush(
@@ -1101,6 +1175,8 @@ begin
   LValuePush.MaxSeq := FMaxSeqLen;
   LValuePush.NumQHeads := FNumQHeads;
   LValuePush.GqaRatio := FNumQHeads div FNumKVHeads;
+  LValuePush.StartPos := AStartPos;
+  LValuePush.SeqLen := LSeqLen;
   FCompute.UpdateDescriptorSetBuffers(FPrefillValueDescSet,
     [FPrefillScoresBuf, FVDecodeF32, AQMat]);
   FCompute.DispatchComputeWithPush(
@@ -1198,6 +1274,23 @@ end;
 function TVdxAttention.GetVCache(const ALayerIndex: Integer): TVdxGpuBuffer;
 begin
   Result := FVDecodeF32;  // shared decode buffer (diagnostic only)
+end;
+
+function TVdxAttention.GetLayerKCacheTQ3(const ALayerIndex: Integer): TVdxGpuBuffer;
+begin
+  Result := FKCacheTQ3[ALayerIndex];
+end;
+
+function TVdxAttention.GetLayerVCacheTQ3(const ALayerIndex: Integer): TVdxGpuBuffer;
+begin
+  Result := FVCacheTQ3[ALayerIndex];
+end;
+
+function TVdxAttention.GetLayerKVCacheTQ3Bytes(): UInt64;
+begin
+  // TQ3 layout: [NumKVHeads x MaxSeq x BlocksPerHead x 4] uint32 per layer.
+  // Each block = 4 uint32 = 16 bytes. Matches the allocation in Init().
+  Result := UInt64(FNumKVHeads) * FMaxSeqLen * (FHeadDim div 32) * 16;
 end;
 
 procedure TVdxAttention.Forward(const AInputBuf: TVdxGpuBuffer;

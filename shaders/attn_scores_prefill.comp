@@ -1,19 +1,27 @@
 #version 450
 
-// Prefill Attention Scores: compute Q*K^T with causal mask for all positions.
-// For each (q_head, q_pos, k_pos):
-//   if k_pos <= q_pos: score = dot(Q, K) * scale
-//   else: score = -1e30 (causal mask, will become 0 after softmax)
+// Prefill Attention Scores: compute Q*K^T with causal mask for a batch of
+// query tokens against the FULL filled KV cache.
+//
+// For each (q_head, q_pos_in_batch, k_pos):
+//   q_abs = start_pos + q_pos_in_batch
+//   if k_pos <= q_abs: score = dot(Q, K) * scale
+//   else:              score = -1e30  (causal mask, becomes 0 after softmax)
 //
 // Q layout: [NumTokens x NumQHeads x HeadDim], row-major
 //   Q[q_pos][q_head] at offset: q_pos * NumQHeads * HeadDim + q_head * HeadDim
 // K cache layout: [NumKVHeads x MaxSeq x HeadDim]
 //   K[kv_head][k_pos] at offset: kv_head * MaxSeq * HeadDim + k_pos * HeadDim
-// Scores layout: [NumQHeads x NumTokens x NumTokens]
-//   scores[q_head][q_pos][k_pos] at: q_head * N * N + q_pos * N + k_pos
+// Scores layout: [NumQHeads x NumTokens x MaxSeq]  (strided by MaxSeq, not NumTokens)
+//   scores[q_head][q_pos][k_pos] at:
+//     q_head * NumTokens * MaxSeq + q_pos * MaxSeq + k_pos
+//   Only the first SeqLen columns of each row are valid; columns
+//   [SeqLen .. MaxSeq) are undefined and must never be read by softmax.
 //
-// Dispatch 3D: (ceil(NumTokens / 256), NumQHeads, NumTokens)
-//   X = key position (thread-per-key), Y = query head, Z = query position
+// Dispatch 3D: (ceil(SeqLen / 256), NumQHeads, NumTokens)
+//   X = key position (thread-per-key), Y = query head, Z = query position in batch
+//   NOTE: X must be sized to SeqLen, not NumTokens — every new Q token
+//   attends over the full filled cache (start_pos + num_tokens keys).
 //
 // Bindings:
 //   0 = Q matrix (float[], readonly)
@@ -21,7 +29,8 @@
 //   2 = scores   (float[], writeonly)
 //
 // Push constants:
-//   head_dim, num_tokens, max_seq, scale, num_q_heads, gqa_ratio
+//   head_dim, num_tokens, max_seq, scale, num_q_heads, gqa_ratio,
+//   start_pos, seq_len
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -32,6 +41,8 @@ layout(push_constant) uniform PushConstants {
     float scale;
     uint  num_q_heads;
     uint  gqa_ratio;
+    uint  start_pos;
+    uint  seq_len;
 } pc;
 
 layout(std430, binding = 0) readonly buffer QBuf {
@@ -51,14 +62,19 @@ void main() {
     uint q_head = gl_WorkGroupID.y;
     uint q_pos = gl_WorkGroupID.z;
 
-    if (k_pos >= pc.num_tokens || q_head >= pc.num_q_heads)
+    if (k_pos >= pc.seq_len || q_head >= pc.num_q_heads || q_pos >= pc.num_tokens)
         return;
 
-    uint N = pc.num_tokens;
-    uint score_idx = q_head * N * N + q_pos * N + k_pos;
+    // Row stride is max_seq, not num_tokens — scores buffer is allocated
+    // [NumQHeads x NumTokens x MaxSeq] so rows can grow as the cache fills.
+    uint score_idx = q_head * pc.num_tokens * pc.max_seq
+                   + q_pos * pc.max_seq
+                   + k_pos;
 
-    // Causal mask: future keys are masked out
-    if (k_pos > q_pos) {
+    // Causal mask using absolute positions: this query's absolute slot is
+    // start_pos + q_pos, and it must not see any k_pos beyond that.
+    uint q_abs = pc.start_pos + q_pos;
+    if (k_pos > q_abs) {
         scores[score_idx] = -1.0e30;
         return;
     }
