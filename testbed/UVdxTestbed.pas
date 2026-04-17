@@ -369,6 +369,513 @@ begin
   end;
 end;
 
+// ===========================================================================
+// Test02 — KV cache continuation across Generate() calls
+//
+// Verifies that FCurrentPosition tracking works end-to-end. The engine must
+// preserve its KV cache across Generate() calls in the same loaded model so
+// that a second call, without a BOS reset, sees the conversation history
+// from the first call.
+//
+// Three phases:
+//
+//   PHASE 1 — SETUP
+//     Seed the cache with a fact ("my favorite color is purple").
+//     Position starts at 0, ends > 0.
+//
+//   PHASE 2 — RECALL (continuation, the actual test)
+//     WITHOUT ResetKVCache, ask "what is my favorite color?". If position
+//     tracking is correct the model sees the setup prompt as prior context
+//     and answers "purple". If broken, the answer will be a guess or refusal.
+//
+//   PHASE 3 — CONTROL
+//     Call ResetKVCache and ask the same question. Model must NOT know —
+//     this proves Phase 2's correct answer came from the cache, not model
+//     knowledge about the concept "favorite color."
+//
+// Greedy sampling (Temperature=0, TopK=1) with fixed seed is used so output
+// is deterministic across runs. Any change in behavior is a real regression,
+// not sampler noise.
+// ===========================================================================
+procedure Test02();
+const
+  CSetupPrompt =
+  '''
+  Please remember this important fact for our conversation: my favorite color
+  is purple. Just reply "OK, I'll remember." and nothing else.
+  ''';
+
+  CRecallPrompt =
+  '''
+  What is my favorite color?
+  ''';
+
+var
+  LInference: TVdxInference;
+  LConfig: TVdxSamplerConfig;
+  LLoaded: Boolean;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn();
+  end;
+
+  procedure PrintPosition(const ALabel: string;
+    const AInference: TVdxInference);
+  begin
+    TVdxUtils.PrintLn(COLOR_CYAN + '[%s] KV cache position: %d',
+      [ALabel, AInference.GetKVCachePosition()]);
+  end;
+
+begin
+  GTokenWriter := TVdxConsoleTokenWriter.Create();
+  try
+    GTokenWriter.MaxWidth := 118;
+
+    LInference := TVdxInference.Create();
+    try
+      LInference.SetStatusCallback(StatusCallback, nil);
+      LInference.SetTokenCallback(PrintToken, nil);
+      LInference.SetInferenceEventCallback(InferenceEventCallback, nil);
+      LInference.SetCancelCallback(CancelCallback, nil);
+
+      LLoaded := LInference.LoadModel(
+        'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
+      try
+        PrintErrors(LInference);
+        if not LLoaded then
+          Exit;
+
+        // Greedy + fixed seed → deterministic outputs across runs so any
+        // behavior change is genuinely a regression, not sampler noise.
+        LConfig := TVdxSampler.DefaultConfig();
+        LConfig.Temperature := 0.0;
+        LConfig.TopK := 1;
+        LConfig.TopP := 1.0;
+        LConfig.MinP := 0.0;
+        LConfig.RepeatPenalty := 1.0;
+        LConfig.RepeatWindow := 64;
+        LConfig.Seed := 1;
+        LInference.SetSamplerConfig(LConfig);
+
+        // --- Phase 1: Setup. Seed the cache with a fact. ---
+        Banner('PHASE 1: SETUP - Teach the model a fact');
+        PrintPosition('before setup', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CSetupPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  setup', LInference);
+        PrintStats(LInference.GetStats());
+
+        // --- Phase 2: Recall (continuation). Position > 0, NO reset. ---
+        // If FCurrentPosition tracking works, the model sees the whole
+        // conversation and should answer "purple".
+        Banner('PHASE 2: RECALL (continuation) - Should remember "purple"');
+        PrintPosition('before recall', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CRecallPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  recall', LInference);
+        PrintStats(LInference.GetStats());
+
+        // --- Phase 3: Control. Reset and ask the same question. ---
+        // After ResetKVCache, the model has no memory of the setup prompt
+        // and should NOT know the color.
+        Banner('PHASE 3: CONTROL (after ResetKVCache) - Should NOT know');
+        LInference.ResetKVCache();
+        PrintPosition('after  reset', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CRecallPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  control', LInference);
+        PrintStats(LInference.GetStats());
+
+      finally
+        LInference.UnloadModel();
+      end;
+    finally
+      LInference.Free();
+    end;
+  finally
+    GTokenWriter.Free();
+    GTokenWriter := nil;
+  end;
+end;
+
+// ===========================================================================
+// Test03 — Save KV cache to disk (half 1 of the cross-process test)
+//
+// Loads the model, seeds the KV cache with a fact ("favorite color is
+// purple"), then saves the cache to session.kvc and exits.
+//
+// Pair this with Test04 to prove cross-process persistence: run Test03
+// once, close the app, then run Test04. If Test04's recall answers
+// "purple", the saved file is truly self-sufficient — it survives full
+// process exit, GPU VRAM teardown, and cold reinitialization.
+// ===========================================================================
+procedure Test03();
+const
+  CSetupPrompt =
+  '''
+  Please remember this important fact for our conversation: my favorite color
+  is purple. Just reply "OK, I'll remember." and nothing else.
+  ''';
+
+  CCacheFile = 'session.kvc';
+
+var
+  LInference: TVdxInference;
+  LConfig: TVdxSamplerConfig;
+  LLoaded: Boolean;
+  LSaved: Boolean;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn();
+  end;
+
+  procedure PrintPosition(const ALabel: string;
+    const AInference: TVdxInference);
+  begin
+    TVdxUtils.PrintLn(COLOR_CYAN + '[%s] KV cache position: %d',
+      [ALabel, AInference.GetKVCachePosition()]);
+  end;
+
+begin
+  GTokenWriter := TVdxConsoleTokenWriter.Create();
+  try
+    GTokenWriter.MaxWidth := 118;
+
+    LInference := TVdxInference.Create();
+    try
+      LInference.SetStatusCallback(StatusCallback, nil);
+      LInference.SetTokenCallback(PrintToken, nil);
+      LInference.SetInferenceEventCallback(InferenceEventCallback, nil);
+      LInference.SetCancelCallback(CancelCallback, nil);
+
+      LLoaded := LInference.LoadModel(
+        'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
+      try
+        PrintErrors(LInference);
+        if not LLoaded then
+          Exit;
+
+        LConfig := TVdxSampler.DefaultConfig();
+        LConfig.Temperature := 0.0;
+        LConfig.TopK := 1;
+        LConfig.TopP := 1.0;
+        LConfig.MinP := 0.0;
+        LConfig.RepeatPenalty := 1.0;
+        LConfig.RepeatWindow := 64;
+        LConfig.Seed := 1;
+        LInference.SetSamplerConfig(LConfig);
+
+        // --- Seed the cache ---
+        Banner('SETUP - Teach the model a fact');
+        PrintPosition('before setup', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CSetupPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  setup', LInference);
+        PrintStats(LInference.GetStats());
+
+        // --- Save to disk ---
+        Banner('SAVE - Dump cache to disk');
+        TVdxUtils.PrintLn(COLOR_WHITE + 'Saving to %s...', [CCacheFile]);
+        LSaved := LInference.SaveKVCache(CCacheFile);
+        PrintErrors(LInference);
+        if LSaved then
+        begin
+          TVdxUtils.PrintLn(COLOR_GREEN + 'Saved successfully.');
+          TVdxUtils.PrintLn();
+          TVdxUtils.PrintLn(COLOR_YELLOW +
+            'NOW: close this app, switch to Test04 (LIndex := 4),');
+          TVdxUtils.PrintLn(COLOR_YELLOW +
+            '     and run again to verify cross-process cache load.');
+        end
+        else
+          TVdxUtils.PrintLn(COLOR_RED + 'Save failed.');
+
+      finally
+        LInference.UnloadModel();
+      end;
+    finally
+      LInference.Free();
+    end;
+  finally
+    GTokenWriter.Free();
+    GTokenWriter := nil;
+  end;
+end;
+
+// ===========================================================================
+// Test04 — Load KV cache from disk and verify (half 2 of the cross-process test)
+//
+// Must be run in a FRESH process after Test03 has completed. Loads the model
+// cold (KV caches are GPU-zero from allocation — no leftover state), does a
+// control Generate to prove this fresh instance genuinely doesn't know the
+// secret fact, then LoadKVCache('session.kvc') and asks the recall question.
+//
+// Expected outcome:
+//   - Control phase: model says "I don't know" (no cross-process leak possible).
+//   - Recall phase after load: model says "Purple." — proving session.kvc
+//     alone fully restores a conversation across a cold process boundary.
+// ===========================================================================
+procedure Test04();
+const
+  CRecallPrompt =
+  '''
+  What is my favorite color?
+  ''';
+
+  CCacheFile = 'session.kvc';
+
+var
+  LInference: TVdxInference;
+  LConfig: TVdxSamplerConfig;
+  LLoaded: Boolean;
+  LRestored: Boolean;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn();
+  end;
+
+  procedure PrintPosition(const ALabel: string;
+    const AInference: TVdxInference);
+  begin
+    TVdxUtils.PrintLn(COLOR_CYAN + '[%s] KV cache position: %d',
+      [ALabel, AInference.GetKVCachePosition()]);
+  end;
+
+begin
+  GTokenWriter := TVdxConsoleTokenWriter.Create();
+  try
+    GTokenWriter.MaxWidth := 118;
+
+    LInference := TVdxInference.Create();
+    try
+      LInference.SetStatusCallback(StatusCallback, nil);
+      LInference.SetTokenCallback(PrintToken, nil);
+      LInference.SetInferenceEventCallback(InferenceEventCallback, nil);
+      LInference.SetCancelCallback(CancelCallback, nil);
+
+      LLoaded := LInference.LoadModel(
+        'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
+      try
+        PrintErrors(LInference);
+        if not LLoaded then
+          Exit;
+
+        LConfig := TVdxSampler.DefaultConfig();
+        LConfig.Temperature := 0.0;
+        LConfig.TopK := 1;
+        LConfig.TopP := 1.0;
+        LConfig.MinP := 0.0;
+        LConfig.RepeatPenalty := 1.0;
+        LConfig.RepeatWindow := 64;
+        LConfig.Seed := 1;
+        LInference.SetSamplerConfig(LConfig);
+
+        // --- Control: prove the fresh process doesn't know ---
+        Banner('CONTROL (fresh process) - Should NOT know the color');
+        PrintPosition('before control', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CRecallPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  control', LInference);
+        PrintStats(LInference.GetStats());
+
+        // Reset so LoadKVCache gets a clean slate.
+        LInference.ResetKVCache();
+
+        // --- Load + Recall ---
+        Banner('LOAD + RECALL - Restore from disk, should remember "purple"');
+        TVdxUtils.PrintLn(COLOR_WHITE + 'Loading from %s...', [CCacheFile]);
+        LRestored := LInference.LoadKVCache(CCacheFile);
+        PrintErrors(LInference);
+        if not LRestored then
+        begin
+          TVdxUtils.PrintLn(COLOR_RED + 'Load failed — aborting.');
+          Exit;
+        end;
+        TVdxUtils.PrintLn(COLOR_GREEN + 'Loaded successfully.');
+        PrintPosition('after  load', LInference);
+
+        GTokenWriter.Reset();
+        LInference.Generate(CRecallPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  recall', LInference);
+        PrintStats(LInference.GetStats());
+
+      finally
+        LInference.UnloadModel();
+      end;
+    finally
+      LInference.Free();
+    end;
+  finally
+    GTokenWriter.Free();
+    GTokenWriter := nil;
+  end;
+end;
+
+// ===========================================================================
+// Test05 — Multi-turn continuation across the full conversation
+//
+// Must be run in a FRESH process after Test03 has saved session.kvc.
+//
+// Proves that once a cache is loaded, you can keep calling Generate()
+// turn after turn. Each call appends its prompt + response to the cache,
+// and subsequent calls see the entire accumulated conversation.
+//
+// Flow:
+//   - Load session.kvc (which ended after the model said "OK, I'll remember.")
+//   - TURN 1: ask an unrelated math question. Model should answer "4" (or
+//     equivalent) without mentioning purple.
+//   - TURN 2: ask the color recall question. Model must still know purple —
+//     the math turn did not evict the original fact.
+//   - TURN 3: ask what was discussed before the color recall. Model must
+//     reference the math question (2+2), proving it sees the full history.
+//
+// Watch the position counter grow monotonically across all three turns.
+// If any turn loses earlier context the test fails.
+// ===========================================================================
+procedure Test05();
+const
+  CMathPrompt =
+  '''
+  Quick question: what is 2 plus 2? Just give me the number.
+  ''';
+
+  CRecallPrompt =
+  '''
+  What is my favorite color?
+  ''';
+
+  CHistoryPrompt =
+  '''
+  Earlier in our conversation, you helped me with a math problem. What was
+  the answer you gave me?
+  ''';
+
+  CCacheFile = 'session.kvc';
+
+var
+  LInference: TVdxInference;
+  LConfig: TVdxSamplerConfig;
+  LLoaded: Boolean;
+  LRestored: Boolean;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW + '========================================================');
+    TVdxUtils.PrintLn();
+  end;
+
+  procedure PrintPosition(const ALabel: string;
+    const AInference: TVdxInference);
+  begin
+    TVdxUtils.PrintLn(COLOR_CYAN + '[%s] KV cache position: %d',
+      [ALabel, AInference.GetKVCachePosition()]);
+  end;
+
+begin
+  GTokenWriter := TVdxConsoleTokenWriter.Create();
+  try
+    GTokenWriter.MaxWidth := 118;
+
+    LInference := TVdxInference.Create();
+    try
+      LInference.SetStatusCallback(StatusCallback, nil);
+      LInference.SetTokenCallback(PrintToken, nil);
+      LInference.SetInferenceEventCallback(InferenceEventCallback, nil);
+      LInference.SetCancelCallback(CancelCallback, nil);
+
+      LLoaded := LInference.LoadModel(
+        'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf');
+      try
+        PrintErrors(LInference);
+        if not LLoaded then
+          Exit;
+
+        LConfig := TVdxSampler.DefaultConfig();
+        LConfig.Temperature := 0.0;
+        LConfig.TopK := 1;
+        LConfig.TopP := 1.0;
+        LConfig.MinP := 0.0;
+        LConfig.RepeatPenalty := 1.0;
+        LConfig.RepeatWindow := 64;
+        LConfig.Seed := 1;
+        LInference.SetSamplerConfig(LConfig);
+
+        // --- Load the saved session ---
+        Banner('LOAD - Restore session from disk');
+        TVdxUtils.PrintLn(COLOR_WHITE + 'Loading from %s...', [CCacheFile]);
+        LRestored := LInference.LoadKVCache(CCacheFile);
+        PrintErrors(LInference);
+        if not LRestored then
+        begin
+          TVdxUtils.PrintLn(COLOR_RED + 'Load failed — aborting.');
+          Exit;
+        end;
+        TVdxUtils.PrintLn(COLOR_GREEN + 'Loaded successfully.');
+        PrintPosition('after  load', LInference);
+
+        // --- TURN 1: unrelated math question ---
+        Banner('TURN 1: MATH - Unrelated question, should NOT mention purple');
+        PrintPosition('before turn 1', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CMathPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  turn 1', LInference);
+        PrintStats(LInference.GetStats());
+
+        // --- TURN 2: color recall (should still work) ---
+        Banner('TURN 2: COLOR RECALL - Must still remember "purple"');
+        PrintPosition('before turn 2', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CRecallPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  turn 2', LInference);
+        PrintStats(LInference.GetStats());
+
+        // --- TURN 3: history probe (references a prior turn) ---
+        Banner('TURN 3: HISTORY - Must reference the math question from turn 1');
+        PrintPosition('before turn 3', LInference);
+        GTokenWriter.Reset();
+        LInference.Generate(CHistoryPrompt, 128);
+        PrintErrors(LInference);
+        PrintPosition('after  turn 3', LInference);
+        PrintStats(LInference.GetStats());
+
+      finally
+        LInference.UnloadModel();
+      end;
+    finally
+      LInference.Free();
+    end;
+  finally
+    GTokenWriter.Free();
+    GTokenWriter := nil;
+  end;
+end;
+
 // ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
 // Selects which test to run via LIndex, wraps in top-level exception handler,
@@ -382,10 +889,14 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 1;
+    LIndex := 5;
 
     case LIndex of
       1: Test01();
+      2: Test02();
+      3: Test03();
+      4: Test04();
+      5: Test05();
     end;
   except
     on E: Exception do
