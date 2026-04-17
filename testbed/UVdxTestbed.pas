@@ -42,7 +42,8 @@ uses
   VindexLLM.Sampler,
   VindexLLM.TokenWriter,
   VindexLLM.Memory,
-  VindexLLM.Embeddings;
+  VindexLLM.Embeddings,
+  VindexLLM.Session;
 
 var
   GTokenWriter: TVdxConsoleTokenWriter;
@@ -2091,6 +2092,169 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Test13_SessionChat — end-to-end exercise of TVdxSession. Loads the
+// inference model with a small context (512) and low rebuild threshold (80),
+// runs a multi-turn conversation via Chat(), verifies turn logging, and
+// drives enough turns to trigger the rebuild cycle. No embedder for this
+// test — FTS5-only retrieval.
+// ---------------------------------------------------------------------------
+procedure Test13_SessionChat();
+const
+  CDbFile = 'test_session.db';
+  CModelPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf';
+var
+  LSession: TVdxSession;
+  LConfig: TVdxSamplerConfig;
+  LResponse: string;
+  LLoaded: Boolean;
+  LPath: string;
+  LPass: Integer;
+  LFail: Integer;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '=== Test13_SessionChat - %s ===', [AText]);
+  end;
+
+  procedure Check(const ALabel: string; const AOk: Boolean);
+  begin
+    if AOk then
+    begin
+      Inc(LPass);
+      TVdxUtils.PrintLn(COLOR_GREEN + '  [PASS] %s', [ALabel]);
+    end
+    else
+    begin
+      Inc(LFail);
+      TVdxUtils.PrintLn(COLOR_RED + '  [FAIL] %s', [ALabel]);
+    end;
+  end;
+
+  procedure PrintSessionErrors(const ASession: TVdxSession);
+  var
+    LErrors: TVdxErrors;
+    LItems: TList<TVdxError>;
+    LI: Integer;
+    LErr: TVdxError;
+  begin
+    LErrors := ASession.GetErrors();
+    if (LErrors = nil) or (LErrors.GetItems().Count = 0) then
+      Exit;
+    LItems := LErrors.GetItems();
+    for LI := 0 to LItems.Count - 1 do
+    begin
+      LErr := LItems[LI];
+      TVdxUtils.PrintLn(COLOR_YELLOW + '  [%s] %s: %s',
+        [LErr.GetSeverityString(), LErr.Code, LErr.Message]);
+    end;
+  end;
+
+begin
+  LPass := 0;
+  LFail := 0;
+  LPath := TPath.Combine(TPath.GetTempPath(), CDbFile);
+
+  // Clean up any leftover DB from a prior run
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  GTokenWriter := TVdxConsoleTokenWriter.Create();
+  try
+    GTokenWriter.MaxWidth := 118;
+
+    Banner('LOAD');
+
+    LSession := TVdxSession.Create();
+    try
+      LSession.SetStatusCallback(StatusCallback, nil);
+      LSession.SetTokenCallback(PrintToken, nil);
+
+      // Load with small context and low rebuild threshold for testing.
+      // No embedder (empty string) — FTS5-only retrieval on rebuild.
+      LLoaded := LSession.LoadModel(CModelPath, LPath, '', 512, 80);
+      PrintSessionErrors(LSession);
+      Check('LoadModel succeeded', LLoaded);
+      if not LLoaded then
+      begin
+        Banner('RESULTS');
+        TVdxUtils.PrintLn(COLOR_RED + '  ABORT - model failed to load');
+        Exit;
+      end;
+
+      Check('IsLoaded returns True', LSession.IsLoaded());
+
+      // Configure sampler — deterministic seed for reproducibility
+      LConfig := TVdxSampler.DefaultConfig();
+      LConfig.Temperature := 1.0;
+      LConfig.TopK := 64;
+      LConfig.TopP := 0.95;
+      LConfig.Seed := 42;
+      LSession.SetSamplerConfig(LConfig);
+
+      // Set system prompt
+      LSession.SetSystemPrompt(
+        'You are a helpful assistant. Keep answers brief.');
+
+      // --- Turn 1 ---
+      Banner('CHAT - Turn 1');
+      LResponse := LSession.Chat(
+        'What is the capital of France?', 64);
+      TVdxUtils.PrintLn('');
+      Check('Turn 1 returned non-empty', LResponse <> '');
+
+      // --- Turn 2 (tests multi-turn continuation) ---
+      Banner('CHAT - Turn 2');
+      LResponse := LSession.Chat('What about Germany?', 64);
+      TVdxUtils.PrintLn('');
+      Check('Turn 2 returned non-empty', LResponse <> '');
+
+      // --- Turn count ---
+      Banner('TURN COUNT');
+      TVdxUtils.PrintLn('  TurnCount: %d', [LSession.GetTurnCount()]);
+      Check('GetTurnCount = 4 (2 user + 2 assistant)',
+        LSession.GetTurnCount() = 4);
+
+      // --- Drive more turns to cross rebuild threshold (80 tokens) ---
+      Banner('CHAT - Turn 3 (driving toward rebuild)');
+      LResponse := LSession.Chat(
+        'Tell me about the solar system.', 128);
+      TVdxUtils.PrintLn('');
+      Check('Turn 3 returned non-empty', LResponse <> '');
+
+      Banner('CHAT - Turn 4 (should trigger rebuild)');
+      LResponse := LSession.Chat(
+        'What is the largest planet?', 128);
+      TVdxUtils.PrintLn('');
+      Check('Turn 4 returned non-empty (post-rebuild)', LResponse <> '');
+
+      // --- Unload ---
+      Banner('UNLOAD');
+      LSession.UnloadModel();
+      Check('IsLoaded returns False after unload',
+        not LSession.IsLoaded());
+
+    finally
+      LSession.Free();
+    end;
+  finally
+    GTokenWriter.Free();
+  end;
+
+  // Clean up test DB
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  Banner('RESULTS');
+  TVdxUtils.PrintLn(COLOR_GREEN + '  Passed: %d', [LPass]);
+  if LFail = 0 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Failed: %d', [LFail])
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  Failed: %d', [LFail]);
+end;
+
+// ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
 // Selects which test to run via LIndex, wraps in top-level exception handler,
 // and pauses for keypress when running from the Delphi IDE so you can read
@@ -2103,7 +2267,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 12;
+    LIndex := 13;
 
     case LIndex of
       1: Test01();
@@ -2118,6 +2282,7 @@ begin
       10: Test10_RebuildThreshold();
       11: Test11_DedupPinPurge();
       12: Test12_DocumentIngest();
+      13: Test13_SessionChat();
     end;
   except
     on E: Exception do

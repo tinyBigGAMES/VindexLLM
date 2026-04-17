@@ -18,6 +18,7 @@ program VdxTestbed;
 uses
   System.SysUtils,
   UVdxTestbed in 'UVdxTestbed.pas',
+  UCommon in 'UCommon.pas',
   VindexLLM.Attention in '..\src\VindexLLM.Attention.pas',
   VindexLLM.ChatTemplate in '..\src\VindexLLM.ChatTemplate.pas',
   VindexLLM.Compute in '..\src\VindexLLM.Compute.pas',
@@ -30,6 +31,7 @@ uses
   VindexLLM.Memory in '..\src\VindexLLM.Memory.pas',
   VindexLLM.Resources in '..\src\VindexLLM.Resources.pas',
   VindexLLM.Sampler in '..\src\VindexLLM.Sampler.pas',
+  VindexLLM.Session in '..\src\VindexLLM.Session.pas',
   VindexLLM.Shaders in '..\src\VindexLLM.Shaders.pas',
   VindexLLM.Tokenizer in '..\src\VindexLLM.Tokenizer.pas',
   VindexLLM.TokenWriter in '..\src\VindexLLM.TokenWriter.pas',
@@ -37,8 +39,7 @@ uses
   VindexLLM.TurboQuant in '..\src\VindexLLM.TurboQuant.pas',
   VindexLLM.Utils in '..\src\VindexLLM.Utils.pas',
   VindexLLM.VirtualBuffer in '..\src\VindexLLM.VirtualBuffer.pas',
-  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas',
-  UCommon in 'UCommon.pas';
+  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas';
 
 begin
   RunVdxTestbed();

@@ -295,7 +295,9 @@ const
 
   // Characters that would be interpreted as FTS5 syntax if passed raw.
   // Stripped from user input before it reaches MATCH.
-  CVdxFTSOperatorSet: TSysCharSet = ['"', '*', '(', ')', ':', '-', '+', '^'];
+  CVdxFTSOperatorSet: TSysCharSet = ['"', '*', '(', ')', ':', '-', '+', '^',
+    '?', '!', ',', '.', ';', '[', ']', '{', '}', '<', '>', '@', '#', '$',
+    '%', '&', '=', '~', '\', '/', '|'];
 
 constructor TVdxMemory.Create();
 begin
