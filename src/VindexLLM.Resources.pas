@@ -76,6 +76,11 @@ resourcestring
   RSVFOpenException     = 'Open(''%s'') raised exception: %s';
   RSVFEmpty             = 'File ''%s'' is empty';
 
+  //--------------------------------------------------------------------------
+  // Shaders (VdxLoadShader) Messages
+  //--------------------------------------------------------------------------
+  RSShNotFound = 'Shader resource ''%s'' not found';
+
 implementation
 
 end.
