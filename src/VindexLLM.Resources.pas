@@ -56,6 +56,26 @@ resourcestring
   RSMemChunkInvalid     = 'AChunkTokens must be > 0';
   RSMemOverlapInvalid   = 'AOverlapTokens must be < AChunkTokens';
 
+  //--------------------------------------------------------------------------
+  // VirtualBuffer (TVdxVirtualBuffer<T>) Messages
+  //--------------------------------------------------------------------------
+  RSVBSizeZero          = 'Allocate size must be greater than zero';
+  RSVBMappingFailed     = 'CreateFileMapping failed (Win32 error %d)';
+  RSVBMapViewFailed     = 'MapViewOfFile failed (Win32 error %d)';
+  RSVBAllocateException = 'Allocate raised exception: %s';
+  RSVBAlignment         = 'File size %d is not aligned with element size %d';
+  RSVBLoadFileException = 'LoadFromFile(''%s'') failed: %s';
+
+  //--------------------------------------------------------------------------
+  // VirtualFile (TVdxVirtualFile<T>) Messages
+  //--------------------------------------------------------------------------
+  RSVFNotOpen           = 'VirtualFile is not open';
+  RSVFOpenFailed        = 'Cannot open file ''%s'' (Win32 error %d)';
+  RSVFMappingFailed     = 'CreateFileMapping on ''%s'' failed (Win32 error %d)';
+  RSVFMapViewFailed     = 'MapViewOfFile on ''%s'' failed (Win32 error %d)';
+  RSVFOpenException     = 'Open(''%s'') raised exception: %s';
+  RSVFEmpty             = 'File ''%s'' is empty';
+
 implementation
 
 end.

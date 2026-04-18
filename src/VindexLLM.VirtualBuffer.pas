@@ -20,12 +20,22 @@ uses
   System.SysUtils,
   System.IOUtils,
   System.Classes,
-  System.SyncObjs;
+  System.SyncObjs,
+  VindexLLM.Utils;
+
+const
+  // Error codes — user-facing messages live in VindexLLM.Resources.
+  VDX_ERROR_VB_SIZE_ZERO          = 'VB01';
+  VDX_ERROR_VB_MAPPING_FAILED     = 'VB02';
+  VDX_ERROR_VB_MAPVIEW_FAILED     = 'VB03';
+  VDX_ERROR_VB_ALLOCATE_EXCEPTION = 'VB04';
+  VDX_ERROR_VB_ALIGNMENT          = 'VB05';
+  VDX_ERROR_VB_LOADFILE_EXCEPTION = 'VB06';
 
 type
 
   { TVdxVirtualBuffer<T> }
-  TVdxVirtualBuffer<T> = class
+  TVdxVirtualBuffer<T> = class(TVdxBaseObject)
   private
     FHandle: THandle;
     FName: string;
@@ -41,8 +51,13 @@ type
     procedure Lock();
     procedure Unlock();
   public
-    constructor Create(const ASize: UInt64);
+    constructor Create(); override;
     destructor Destroy(); override;
+
+    // Allocate or re-allocate the backing memory-mapped region.
+    // Returns False and populates FErrors on OS failure. Safe to
+    // call multiple times — releases prior mapping first.
+    function Allocate(const ASize: UInt64): Boolean;
 
     // Stream read/write
     function Write(const ABuffer; const ACount: UInt64): UInt64; overload;
@@ -77,6 +92,9 @@ type
   end;
 
 implementation
+
+uses
+  VindexLLM.Resources;
 
 { TVdxVirtualBuffer }
 procedure TVdxVirtualBuffer<T>.Lock();
@@ -144,32 +162,72 @@ begin
   end;
 end;
 
-constructor TVdxVirtualBuffer<T>.Create(const ASize: UInt64);
+constructor TVdxVirtualBuffer<T>.Create();
+begin
+  inherited Create();
+  FCriticalSection := TCriticalSection.Create();
+  FHandle := 0;
+  FMemory := nil;
+  FSize := 0;
+  FPosition := 0;
+  FName := '';
+end;
+
+function TVdxVirtualBuffer<T>.Allocate(const ASize: UInt64): Boolean;
 var
   LSizeHigh: DWORD;
   LSizeLow: DWORD;
+  LTotalBytes: UInt64;
 begin
-  inherited Create();
+  Result := False;
 
-  FCriticalSection := TCriticalSection.Create();
-
-  FSize := UInt64(SizeOf(T)) * ASize;
-  LSizeLow := DWORD(FSize and $FFFFFFFF);
-  LSizeHigh := DWORD(FSize shr 32);
-
-  FName := TPath.GetGUIDFileName();
-  FHandle := CreateFileMapping(INVALID_HANDLE_VALUE, nil, PAGE_READWRITE, LSizeHigh, LSizeLow, PChar(FName));
-  if FHandle = 0 then
-    raise Exception.Create('Error creating memory mapping');
-
-  FMemory := MapViewOfFile(FHandle, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-  if FMemory = nil then
+  if ASize = 0 then
   begin
-    CloseHandle(FHandle);
-    raise Exception.Create('Error mapping view of file');
+    FErrors.Add(esError, VDX_ERROR_VB_SIZE_ZERO, RSVBSizeZero);
+    Exit;
   end;
 
+  // Idempotent re-allocate: release any prior mapping first.
+  Clear();
+
+  LTotalBytes := UInt64(SizeOf(T)) * ASize;
+  LSizeLow  := DWORD(LTotalBytes and $FFFFFFFF);
+  LSizeHigh := DWORD(LTotalBytes shr 32);
+
+  FName := TPath.GetGUIDFileName();
+
+  try
+    FHandle := CreateFileMapping(INVALID_HANDLE_VALUE, nil,
+      PAGE_READWRITE, LSizeHigh, LSizeLow, PChar(FName));
+    if FHandle = 0 then
+    begin
+      FErrors.Add(esFatal, VDX_ERROR_VB_MAPPING_FAILED,
+        RSVBMappingFailed, [GetLastError()]);
+      Exit;
+    end;
+
+    FMemory := MapViewOfFile(FHandle, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if FMemory = nil then
+    begin
+      FErrors.Add(esFatal, VDX_ERROR_VB_MAPVIEW_FAILED,
+        RSVBMapViewFailed, [GetLastError()]);
+      CloseHandle(FHandle);
+      FHandle := 0;
+      Exit;
+    end;
+  except
+    on E: Exception do
+    begin
+      FErrors.Add(esFatal, VDX_ERROR_VB_ALLOCATE_EXCEPTION,
+        RSVBAllocateException, [E.Message]);
+      Clear();
+      Exit;
+    end;
+  end;
+
+  FSize := LTotalBytes;
   FPosition := 0;
+  Result := True;
 end;
 
 destructor TVdxVirtualBuffer<T>.Destroy();
@@ -288,18 +346,34 @@ var
   LFileSize: Int64;
   LElements: UInt64;
 begin
-  LFileStream := TFileStream.Create(AFilename, fmOpenRead or fmShareDenyWrite);
+  // Always returns a non-nil instance. Caller MUST check
+  // Result.HasFatal() before using it — on failure, FErrors is
+  // populated with the reason and the instance is empty.
+  Result := TVdxVirtualBuffer<T>.Create();
   try
-    LFileSize := LFileStream.Size;
-    if LFileSize mod SizeOf(T) <> 0 then
-      raise Exception.Create('File size is not aligned with element size');
+    LFileStream := TFileStream.Create(AFilename, fmOpenRead or fmShareDenyWrite);
+    try
+      LFileSize := LFileStream.Size;
+      if LFileSize mod SizeOf(T) <> 0 then
+      begin
+        Result.FErrors.Add(esFatal, VDX_ERROR_VB_ALIGNMENT,
+          RSVBAlignment, [LFileSize, SizeOf(T)]);
+        Exit;
+      end;
 
-    LElements := LFileSize div SizeOf(T);
-    Result := TVdxVirtualBuffer<T>.Create(LElements);
-    LFileStream.ReadBuffer(Result.FMemory^, LFileSize);
-    Result.FPosition := 0;
-  finally
-    LFileStream.Free();
+      LElements := LFileSize div SizeOf(T);
+      if not Result.Allocate(LElements) then
+        Exit;  // FErrors already populated by Allocate
+
+      LFileStream.ReadBuffer(Result.FMemory^, LFileSize);
+      Result.FPosition := 0;
+    finally
+      LFileStream.Free();
+    end;
+  except
+    on E: Exception do
+      Result.FErrors.Add(esFatal, VDX_ERROR_VB_LOADFILE_EXCEPTION,
+        RSVBLoadFileException, [AFilename, E.Message]);
   end;
 end;
 

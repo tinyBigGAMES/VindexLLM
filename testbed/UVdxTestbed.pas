@@ -19,14 +19,11 @@ implementation
 
 uses
   WinAPI.Windows,
-  System.Generics.Collections,
   System.SysUtils,
-  VindexLLM.Utils;
-
-
-procedure Test_XXXX();
-begin
-end;
+  VindexLLM.Utils,
+  VindexLLM.TestCase,
+  UTest.VirtualBuffer,
+  UTest.VirtualFile;
 
 // ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
@@ -41,10 +38,11 @@ begin
   try
     TVdxUtils.Pause('Press any key to start...');
 
-    LIndex := 1;
+    LIndex := 2;
 
     case LIndex of
-      1: Test_XXXX();
+      1: VdxRunTestCase(TVirtualBufferTest);
+      2: VdxRunTestCase(TVirtualFileTest);
     end;
   except
     on E: Exception do
