@@ -41,6 +41,43 @@ const
 
 type
 
+  // --------------------------------------------------------------------------
+  // Raw-pointer array helpers — typed views over arbitrary memory buffers
+  // for random-access indexing. Upper bound is the largest addressable
+  // index for the element size; never actually allocated at that extent.
+  // Use with caution — no bounds checking (caller owns allocation size).
+  // --------------------------------------------------------------------------
+
+  PInt8Array   = ^TInt8Array;
+  TInt8Array   = array[0..MaxInt div SizeOf(Int8) - 1]   of Int8;
+
+  PUInt8Array  = ^TUInt8Array;
+  TUInt8Array  = array[0..MaxInt div SizeOf(UInt8) - 1]  of UInt8;
+
+  PInt16Array  = ^TInt16Array;
+  TInt16Array  = array[0..MaxInt div SizeOf(Int16) - 1]  of Int16;
+
+  PUInt16Array = ^TUInt16Array;
+  TUInt16Array = array[0..MaxInt div SizeOf(UInt16) - 1] of UInt16;
+
+  PInt32Array  = ^TInt32Array;
+  TInt32Array  = array[0..MaxInt div SizeOf(Int32) - 1]  of Int32;
+
+  PUInt32Array = ^TUInt32Array;
+  TUInt32Array = array[0..MaxInt div SizeOf(UInt32) - 1] of UInt32;
+
+  PInt64Array  = ^TInt64Array;
+  TInt64Array  = array[0..MaxInt div SizeOf(Int64) - 1]  of Int64;
+
+  PUInt64Array = ^TUInt64Array;
+  TUInt64Array = array[0..MaxInt div SizeOf(UInt64) - 1] of UInt64;
+
+  PSingleArray = ^TSingleArray;
+  TSingleArray = array[0..MaxInt div SizeOf(Single) - 1] of Single;
+
+  PDoubleArray = ^TDoubleArray;
+  TDoubleArray = array[0..MaxInt div SizeOf(Double) - 1] of Double;
+
   { TVdxCallback }
   TVdxCallback<T> = record
     Callback: T;
