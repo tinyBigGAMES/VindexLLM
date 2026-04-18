@@ -77,6 +77,17 @@ resourcestring
   RSVFEmpty             = 'File ''%s'' is empty';
 
   //--------------------------------------------------------------------------
+  // Compute (TVdxCompute) Messages
+  //--------------------------------------------------------------------------
+  RSVkLibLoadFailed    = 'Failed to load vulkan-1.dll - no Vulkan driver installed';
+  RSVkProcMissing      = 'Vulkan proc not found: %s';
+  RSVkNoGpu            = 'No Vulkan-capable GPU found';
+  RSVkNoComputeQueue   = 'No GPU with compute queue found';
+  RSVkGpuIndexInvalid  = 'GPU index %d out of range (found %d device(s))';
+  RSVkNoMemoryType     = 'No suitable memory type (bits=$%x, props=$%x)';
+  RSVkCallFailed       = '%s failed (VkResult=%d)';
+
+  //--------------------------------------------------------------------------
   // Shaders (VdxLoadShader) Messages
   //--------------------------------------------------------------------------
   RSShNotFound = 'Shader resource ''%s'' not found';
