@@ -110,30 +110,7 @@
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
         <DCCReference Include="UVdxTestbed.pas"/>
-        <DCCReference Include="UCommon.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Attention.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Chat.pas"/>
-        <DCCReference Include="..\src\VindexLLM.ChatTemplate.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Compute.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Config.pas"/>
-        <DCCReference Include="..\src\VindexLLM.ConsoleChat.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Embeddings.pas"/>
-        <DCCReference Include="..\src\VindexLLM.FFNWeights.pas"/>
-        <DCCReference Include="..\src\VindexLLM.GGUFReader.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Inference.pas"/>
-        <DCCReference Include="..\src\VindexLLM.LayerNorm.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Memory.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Resources.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Sampler.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Session.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Shaders.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
-        <DCCReference Include="..\src\VindexLLM.TokenWriter.pas"/>
-        <DCCReference Include="..\src\VindexLLM.TOML.pas"/>
-        <DCCReference Include="..\src\VindexLLM.TurboQuant.pas"/>
         <DCCReference Include="..\src\VindexLLM.Utils.pas"/>
-        <DCCReference Include="..\src\VindexLLM.VirtualBuffer.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Vulkan.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

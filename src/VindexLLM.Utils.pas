@@ -135,47 +135,6 @@ type
 
   end;
 
-  { TVdxBaseObject }
-  TVdxBaseObject = class
-  {$IFDEF VPR_LEAK_TRACK}
-  private class var
-    FLeakInstances: TDictionary<Pointer, string>;
-    FLeakCounter: Int64;
-  public
-    class procedure InitLeakTracking(); static;
-    class procedure FinalizeLeakTracking(); static;
-    class procedure DumpLeaks(); static;
-    class function  LeakLiveCount(): Integer; static;
-    procedure LeakTrackUpdateLabel(const AExtra: string);
-  {$ENDIF}
-  public
-    constructor Create(); virtual;
-    destructor Destroy(); override;
-    function Dump(const AId: Integer = 0): string; virtual;
-    procedure InitConfig(); virtual;
-    procedure LoadConfig(); virtual;
-    procedure SaveConfig(); virtual;
-  end;
-
-  { TVdxCommandBuilder }
-  TVdxCommandBuilder = class(TVdxBaseObject)
-  private
-    FParams: TStringList;
-  public
-    constructor Create(); override;
-    destructor Destroy(); override;
-
-    procedure Clear();
-    procedure AddParam(const AParam: string); overload;
-    procedure AddParam(const AFlag, AValue: string); overload;
-    procedure AddQuotedParam(const AFlag, AValue: string); overload;
-    procedure AddQuotedParam(const AValue: string); overload;
-    procedure AddFlag(const AFlag: string);
-
-    function Dump(const AId: Integer = 0): string; override;
-    function GetParamCount(): Integer;
-  end;
-
   { TVdxErrorSeverity }
   TVdxErrorSeverity = (
     esHint,
@@ -220,7 +179,7 @@ type
   end;
 
   { TVdxErrors }
-  TVdxErrors = class(TVdxBaseObject)
+  TVdxErrors = class
   private
     FItems: TList<TVdxError>;
     FMaxErrors: Integer;
@@ -228,7 +187,7 @@ type
     function CountErrors(): Integer;
 
   public
-    constructor Create(); override;
+    constructor Create(); virtual;
     destructor Destroy(); override;
 
     // Full location with range
@@ -307,39 +266,48 @@ type
     function GetItems(): TList<TVdxError>;
     function GetMaxErrors(): Integer;
     procedure SetMaxErrors(const AMaxErrors: Integer);
-    function Dump(const AId: Integer = 0): string; override;
+    function ToString(): string; override;
   end;
 
-  { TVdxStatusObject }
-  TVdxStatusObject = class(TVdxBaseObject)
+  { TVdxBaseObject }
+  TVdxBaseObject = class
   protected
+    FErrors: TVdxErrors;
+    FOwnsErrors: Boolean;
     FStatusCallback: TVdxCallback<TVdxStatusCallback>;
   public
-    constructor Create(); override;
+    constructor Create(); virtual;
     destructor Destroy(); override;
+    function Dump(const AId: Integer = 0): string; virtual;
+    procedure InitConfig(); virtual;
+    procedure LoadConfig(const AFilename: string); virtual;
+    procedure SaveConfig(const AFilename: string); virtual;
     procedure Status(const AText: string); overload;
     procedure Status(const AText: string; const AArgs: array of const); overload;
     function  GetStatusCallback(): TVdxStatusCallback;
     procedure SetStatusCallback(const ACallback: TVdxStatusCallback; const AUserData: Pointer = nil); virtual;
-  end;
-
-  { TVdxErrorsObject }
-  TVdxErrorsObject = class(TVdxStatusObject)
-  protected
-    FErrors: TVdxErrors;
-  public
     procedure SetErrors(const AErrors: TVdxErrors); virtual;
-    function GetErrors(): TVdxErrors;
+    function  GetErrors(): TVdxErrors;
+    procedure PropagateErrors(const AChild: TVdxBaseObject);
   end;
 
-  { TVdxOutputObject }
-  TVdxOutputObject = class(TVdxStatusObject)
-  protected
-    FOutput: TVdxCallback<TVdxCaptureConsoleCallback>;
+  { TVdxCommandBuilder }
+  TVdxCommandBuilder = class(TVdxBaseObject)
+  private
+    FParams: TStringList;
   public
-    procedure SetOutputCallback(const ACallback: TVdxCaptureConsoleCallback;
-      const AUserData: Pointer = nil); virtual;
-    function GetOutputCallback(): TVdxCaptureConsoleCallback;
+    constructor Create(); override;
+    destructor Destroy(); override;
+
+    procedure Clear();
+    procedure AddParam(const AParam: string); overload;
+    procedure AddParam(const AFlag, AValue: string); overload;
+    procedure AddQuotedParam(const AFlag, AValue: string); overload;
+    procedure AddQuotedParam(const AValue: string); overload;
+    procedure AddFlag(const AFlag: string);
+
+    function Dump(const AId: Integer = 0): string; override;
+    function GetParamCount(): Integer;
   end;
 
 implementation
@@ -1941,201 +1909,7 @@ begin
   end;
 end;
 
-{ TVdxBaseObject }
-
-{$IFDEF VPR_LEAK_TRACK}
-class procedure TVdxBaseObject.InitLeakTracking();
-begin
-  FLeakInstances := TDictionary<Pointer, string>.Create();
-  FLeakCounter := 0;
-end;
-
-class procedure TVdxBaseObject.FinalizeLeakTracking();
-begin
-  DumpLeaks();
-  FreeAndNil(FLeakInstances);
-end;
-
-class procedure TVdxBaseObject.DumpLeaks();
-var
-  LCounts: TDictionary<string, Integer>;
-  LPair: TPair<Pointer, string>;
-  LCountPair: TPair<string, Integer>;
-  LCount: Integer;
-begin
-  if FLeakInstances = nil then Exit;
-  if FLeakInstances.Count = 0 then
-  begin
-    WriteLn('[LeakTrack] No leaks detected.');
-    Exit;
-  end;
-
-  // Group by class name and count
-  LCounts := TDictionary<string, Integer>.Create();
-  try
-    for LPair in FLeakInstances do
-    begin
-      if LCounts.TryGetValue(LPair.Value, LCount) then
-        LCounts[LPair.Value] := LCount + 1
-      else
-        LCounts.Add(LPair.Value, 1);
-    end;
-
-    WriteLn('[LeakTrack] === LEAKED INSTANCES (' +
-      FLeakInstances.Count.ToString() + ' total) ===');
-    for LCountPair in LCounts do
-      WriteLn('[LeakTrack]   ' + LCountPair.Key + ': ' +
-        LCountPair.Value.ToString());
-    WriteLn('[LeakTrack] =======================================');
-  finally
-    LCounts.Free();
-  end;
-end;
-
-class function TVdxBaseObject.LeakLiveCount(): Integer;
-begin
-  if FLeakInstances <> nil then
-    Result := FLeakInstances.Count
-  else
-    Result := 0;
-end;
-
-procedure TVdxBaseObject.LeakTrackUpdateLabel(const AExtra: string);
-var
-  LCurrent: string;
-begin
-  if (FLeakInstances <> nil) and
-     FLeakInstances.TryGetValue(Pointer(Self), LCurrent) then
-    FLeakInstances[Pointer(Self)] := LCurrent + ' (' + AExtra + ')';
-end;
-{$ENDIF}
-
-constructor TVdxBaseObject.Create();
-begin
-  inherited;
-  {$IFDEF VPR_LEAK_TRACK}
-  if FLeakInstances <> nil then
-  begin
-    Inc(FLeakCounter);
-    FLeakInstances.AddOrSetValue(Pointer(Self), ClassName +
-      ' #' + FLeakCounter.ToString());
-  end;
-  {$ENDIF}
-end;
-
-destructor TVdxBaseObject.Destroy();
-begin
-  {$IFDEF VPR_LEAK_TRACK}
-  if FLeakInstances <> nil then
-    FLeakInstances.Remove(Pointer(Self));
-  {$ENDIF}
-  inherited;
-end;
-
-function TVdxBaseObject.Dump(const AId: Integer): string;
-begin
-  Result := '';
-end;
-
-procedure TVdxBaseObject.InitConfig();
-begin
-end;
-
-procedure TVdxBaseObject.LoadConfig();
-begin
-end;
-
-procedure TVdxBaseObject.SaveConfig();
-begin
-end;
-
-{ TVdxCommandBuilder }
-
-constructor TVdxCommandBuilder.Create();
-begin
-  inherited;
-
-  FParams := TStringList.Create();
-  FParams.Delimiter := ' ';
-  FParams.StrictDelimiter := True;
-end;
-
-destructor TVdxCommandBuilder.Destroy();
-begin
-  FreeAndNil(FParams);
-
-  inherited;
-end;
-
-procedure TVdxCommandBuilder.Clear();
-begin
-  FParams.Clear();
-end;
-
-procedure TVdxCommandBuilder.AddParam(const AParam: string);
-begin
-  if AParam <> '' then
-    FParams.Add(AParam);
-end;
-
-procedure TVdxCommandBuilder.AddParam(const AFlag, AValue: string);
-begin
-  if AFlag <> '' then
-  begin
-    if AValue <> '' then
-      FParams.Add(AFlag + AValue)
-    else
-      FParams.Add(AFlag);
-  end
-  else if AValue <> '' then
-    FParams.Add(AValue);
-end;
-
-procedure TVdxCommandBuilder.AddQuotedParam(const AFlag, AValue: string);
-begin
-  if AValue = '' then
-    Exit;
-
-  if AFlag <> '' then
-    FParams.Add(AFlag + ' "' + AValue + '"')
-  else
-    FParams.Add('"' + AValue + '"');
-end;
-
-procedure TVdxCommandBuilder.AddQuotedParam(const AValue: string);
-begin
-  AddQuotedParam('', AValue);
-end;
-
-procedure TVdxCommandBuilder.AddFlag(const AFlag: string);
-begin
-  if AFlag <> '' then
-    FParams.Add(AFlag);
-end;
-
-function TVdxCommandBuilder.Dump(const AId: Integer): string;
-var
-  LI: Integer;
-begin
-  if FParams.Count = 0 then
-  begin
-    Result := '';
-    Exit;
-  end;
-
-  // Manually join with spaces to avoid TStringList.DelimitedText auto-quoting
-  Result := FParams[0];
-  for LI := 1 to FParams.Count - 1 do
-    Result := Result + ' ' + FParams[LI];
-end;
-
-function TVdxCommandBuilder.GetParamCount(): Integer;
-begin
-  Result := FParams.Count;
-end;
-
 { TVdxSourceRange }
-
 procedure TVdxSourceRange.Clear();
 begin
   Filename := '';
@@ -2482,7 +2256,7 @@ begin
   FMaxErrors := AMaxErrors;
 end;
 
-function TVdxErrors.Dump(const AId: Integer): string;
+function TVdxErrors.ToString(): string;
 var
   LBuilder: TStringBuilder;
   LI: Integer;
@@ -2501,64 +2275,186 @@ begin
   end;
 end;
 
-{ TVdxStatusObject }
+{ TVdxBaseObject }
 
-constructor TVdxStatusObject.Create();
+constructor TVdxBaseObject.Create();
 begin
+  inherited;
+  FErrors := TVdxErrors.Create();
+  FOwnsErrors := True;
+end;
+
+destructor TVdxBaseObject.Destroy();
+begin
+  if FOwnsErrors and (FErrors <> nil) then
+    FErrors.Free();
+  FErrors := nil;
   inherited;
 end;
 
-destructor TVdxStatusObject.Destroy();
+function TVdxBaseObject.Dump(const AId: Integer): string;
 begin
-  inherited;
+  Result := '';
 end;
 
-procedure TVdxStatusObject.Status(const AText: string);
+procedure TVdxBaseObject.InitConfig();
+begin
+end;
+
+procedure TVdxBaseObject.LoadConfig(const AFilename: string);
+begin
+end;
+
+procedure TVdxBaseObject.SaveConfig(const AFilename: string);
+begin
+end;
+
+
+procedure TVdxBaseObject.Status(const AText: string);
 begin
   if FStatusCallback.IsAssigned() then
     FStatusCallback.Callback(AText, FStatusCallback.UserData);
 end;
 
-procedure TVdxStatusObject.Status(const AText: string; const AArgs: array of const);
+procedure TVdxBaseObject.Status(const AText: string; const AArgs: array of const);
 begin
   Status(Format(AText, AArgs));
 end;
 
-function TVdxStatusObject.GetStatusCallback(): TVdxStatusCallback;
+function TVdxBaseObject.GetStatusCallback(): TVdxStatusCallback;
 begin
   Result := FStatusCallback.Callback;
 end;
 
-procedure TVdxStatusObject.SetStatusCallback(const ACallback: TVdxStatusCallback; const AUserData: Pointer);
+procedure TVdxBaseObject.SetStatusCallback(const ACallback: TVdxStatusCallback; const AUserData: Pointer);
 begin
   FStatusCallback.Callback := ACallback;
   FStatusCallback.UserData := AUserData;
 end;
 
-{ TVdxErrorsObject }
-
-procedure TVdxErrorsObject.SetErrors(const AErrors: TVdxErrors);
+procedure TVdxBaseObject.SetErrors(const AErrors: TVdxErrors);
 begin
-  FErrors := AErrors;
+  // Self-reference guard — prevents double-free if caller does
+  // Obj.SetErrors(Obj.GetErrors()).
+  if AErrors = FErrors then
+    Exit;
+
+  // Release current instance if we own it.
+  if FOwnsErrors and (FErrors <> nil) then
+    FErrors.Free();
+
+  if AErrors = nil then
+  begin
+    // Reset to self-owned new instance.
+    FErrors := TVdxErrors.Create();
+    FOwnsErrors := True;
+  end
+  else
+  begin
+    // Borrow external — caller retains ownership.
+    FErrors := AErrors;
+    FOwnsErrors := False;
+  end;
 end;
 
-function TVdxErrorsObject.GetErrors(): TVdxErrors;
+function TVdxBaseObject.GetErrors(): TVdxErrors;
 begin
   Result := FErrors;
 end;
 
-{ TVdxOutputObject }
-
-procedure TVdxOutputObject.SetOutputCallback(
-  const ACallback: TVdxCaptureConsoleCallback; const AUserData: Pointer);
+procedure TVdxBaseObject.PropagateErrors(const AChild: TVdxBaseObject);
 begin
-  FOutput.Callback := ACallback;
-  FOutput.UserData := AUserData;
+  // Share this object's FErrors with a child component. The child
+  // switches to reference mode (FOwnsErrors := False); this object
+  // retains ownership. Nil children are silently ignored.
+  if AChild = nil then
+    Exit;
+  AChild.SetErrors(FErrors);
 end;
 
-function TVdxOutputObject.GetOutputCallback(): TVdxCaptureConsoleCallback;
+{ TVdxCommandBuilder }
+
+constructor TVdxCommandBuilder.Create();
 begin
-  Result := FOutput.Callback;
+  inherited;
+
+  FParams := TStringList.Create();
+  FParams.Delimiter := ' ';
+  FParams.StrictDelimiter := True;
+end;
+
+destructor TVdxCommandBuilder.Destroy();
+begin
+  FreeAndNil(FParams);
+
+  inherited;
+end;
+
+procedure TVdxCommandBuilder.Clear();
+begin
+  FParams.Clear();
+end;
+
+procedure TVdxCommandBuilder.AddParam(const AParam: string);
+begin
+  if AParam <> '' then
+    FParams.Add(AParam);
+end;
+
+procedure TVdxCommandBuilder.AddParam(const AFlag, AValue: string);
+begin
+  if AFlag <> '' then
+  begin
+    if AValue <> '' then
+      FParams.Add(AFlag + AValue)
+    else
+      FParams.Add(AFlag);
+  end
+  else if AValue <> '' then
+    FParams.Add(AValue);
+end;
+
+procedure TVdxCommandBuilder.AddQuotedParam(const AFlag, AValue: string);
+begin
+  if AValue = '' then
+    Exit;
+
+  if AFlag <> '' then
+    FParams.Add(AFlag + ' "' + AValue + '"')
+  else
+    FParams.Add('"' + AValue + '"');
+end;
+
+procedure TVdxCommandBuilder.AddQuotedParam(const AValue: string);
+begin
+  AddQuotedParam('', AValue);
+end;
+
+procedure TVdxCommandBuilder.AddFlag(const AFlag: string);
+begin
+  if AFlag <> '' then
+    FParams.Add(AFlag);
+end;
+
+function TVdxCommandBuilder.Dump(const AId: Integer): string;
+var
+  LI: Integer;
+begin
+  if FParams.Count = 0 then
+  begin
+    Result := '';
+    Exit;
+  end;
+
+  // Manually join with spaces to avoid TStringList.DelimitedText auto-quoting
+  Result := FParams[0];
+  for LI := 1 to FParams.Count - 1 do
+    Result := Result + ' ' + FParams[LI];
+end;
+
+function TVdxCommandBuilder.GetParamCount(): Integer;
+begin
+  Result := FParams.Count;
 end;
 
 // ===========================================================================
