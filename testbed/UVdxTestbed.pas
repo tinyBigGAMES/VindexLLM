@@ -31,7 +31,8 @@ uses
   UTest.Attention,
   UTest.FFNWeights,
   UTest.TurboQuant,
-  UTest.Sampler;
+  UTest.Sampler,
+  UTest.Model.Gemma3;
 
 // ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
@@ -46,7 +47,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start...');
 
-    LIndex := 10;
+    LIndex := 11;
 
     case LIndex of
       1: VdxRunTestCase(TVirtualBufferTest);
@@ -59,6 +60,7 @@ begin
       8: VdxRunTestCase(TFFNWeightsTest);
       9: VdxRunTestCase(TTurboQuantTest);
       10: VdxRunTestCase(TSamplerTest);
+      11: VdxRunTestCase(TModelGemma3Test);
     end;
   except
     on E: Exception do
