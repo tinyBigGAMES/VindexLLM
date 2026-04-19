@@ -92,6 +92,16 @@ resourcestring
   //--------------------------------------------------------------------------
   RSShNotFound = 'Shader resource ''%s'' not found';
 
+  //--------------------------------------------------------------------------
+  // GGUFReader (TVdxGGUFReader) Messages
+  //--------------------------------------------------------------------------
+  RSGGReadPastEOF        = 'GGUF read past end of file: offset=%d, need=%d, filesize=%d';
+  RSGGBadMagic           = 'Invalid GGUF magic: expected $%08X, got $%08X';
+  RSGGUnsupportedVersion = 'Unsupported GGUF version: %d (need >= 2)';
+  RSGGUnknownMetaType    = 'Unknown GGUF metadata type: %d';
+  RSGGNoDataBase         = 'GGUF file not open or tensor data base not computed';
+  RSGGParseException     = 'GGUF parse raised exception: %s';
+
 implementation
 
 end.
