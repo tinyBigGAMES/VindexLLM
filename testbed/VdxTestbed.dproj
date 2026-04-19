@@ -119,6 +119,7 @@
         <DCCReference Include="UTest.VirtualBuffer.pas"/>
         <DCCReference Include="UTest.VirtualFile.pas"/>
         <DCCReference Include="UVdxTestbed.pas"/>
+        <DCCReference Include="UTest.Sampler.pas"/>
         <DCCReference Include="..\src\VindexLLM.Attention.pas"/>
         <DCCReference Include="..\src\VindexLLM.Compute.pas"/>
         <DCCReference Include="..\src\VindexLLM.Config.pas"/>
@@ -126,6 +127,7 @@
         <DCCReference Include="..\src\VindexLLM.GGUFReader.pas"/>
         <DCCReference Include="..\src\VindexLLM.LayerNorm.pas"/>
         <DCCReference Include="..\src\VindexLLM.Resources.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Sampler.pas"/>
         <DCCReference Include="..\src\VindexLLM.Shaders.pas"/>
         <DCCReference Include="..\src\VindexLLM.TestCase.pas"/>
         <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
