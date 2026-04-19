@@ -31,7 +31,8 @@ uses
   VindexLLM.Utils in '..\src\VindexLLM.Utils.pas',
   VindexLLM.VirtualBuffer in '..\src\VindexLLM.VirtualBuffer.pas',
   VindexLLM.VirtualFile in '..\src\VindexLLM.VirtualFile.pas',
-  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas';
+  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas',
+  VindexLLM.Tokenizer in '..\src\VindexLLM.Tokenizer.pas';
 
 begin
   RunVdxTestbed();

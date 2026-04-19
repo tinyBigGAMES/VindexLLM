@@ -124,6 +124,7 @@
         <DCCReference Include="..\src\VindexLLM.VirtualBuffer.pas"/>
         <DCCReference Include="..\src\VindexLLM.VirtualFile.pas"/>
         <DCCReference Include="..\src\VindexLLM.Vulkan.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

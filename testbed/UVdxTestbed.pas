@@ -25,7 +25,8 @@ uses
   UTest.VirtualBuffer,
   UTest.VirtualFile,
   UTest.Compute,
-  UTest.GGUFReader;
+  UTest.GGUFReader,
+  UTest.Tokenizer;
 
 // ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
@@ -40,13 +41,14 @@ begin
   try
     TVdxUtils.Pause('Press any key to start...');
 
-    LIndex := 4;
+    LIndex := 5;
 
     case LIndex of
       1: VdxRunTestCase(TVirtualBufferTest);
       2: VdxRunTestCase(TVirtualFileTest);
       3: VdxRunTestCase(TComputeTest);
       4: VdxRunTestCase(TGGUFReaderTest);
+      5: VdxRunTestCase(TTokenizerTest);
     end;
   except
     on E: Exception do
