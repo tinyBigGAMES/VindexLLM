@@ -455,14 +455,16 @@ end;
 // ---------------------------------------------------------------------------
 procedure TComputeTest.SecStreamingStagingPool();
 const
-  CSmall: UInt64 = 1024;
-  CLarge: UInt64 = 4096;
+  CCountSmall:  UInt32 = 2;
+  CCountLarge:  UInt32 = 4;
+  CBytesSmall:  UInt64 = 1024;
+  CBytesLarge:  UInt64 = 4096;
 var
   LSrcBytes: TBytes;
   LDstBytes: TBytes;
   LScratch:  TVdxGpuBuffer;
-  LHostAfterSmall:   VkBuffer;
-  LDeviceAfterSmall: VkBuffer;
+  LHost0AfterSmall: VkBuffer;
+  LDev0AfterSmall:  VkBuffer;
   LI: Integer;
   LMatches: Boolean;
 begin
@@ -470,92 +472,106 @@ begin
 
   // Initial state
   Check(FCompute.GetStagingCapacity() = 0,
-    'Capacity 0 before first EnsureStagingCapacity');
-  Check(FCompute.GetStagingHost().Buffer = VK_NULL_HANDLE,
-    'Host handle null before first EnsureStagingCapacity');
-  Check(FCompute.GetStagingDevice().Buffer = VK_NULL_HANDLE,
-    'Device handle null before first EnsureStagingCapacity');
+    'Capacity 0 before first EnsureStagingPool');
+  Check(FCompute.GetStagingCount() = 0,
+    'Count 0 before first EnsureStagingPool');
+  Check(FCompute.GetStagingHost(0).Buffer = VK_NULL_HANDLE,
+    'Host[0] null before first EnsureStagingPool');
+  Check(FCompute.GetStagingDevice(0).Buffer = VK_NULL_HANDLE,
+    'Device[0] null before first EnsureStagingPool');
 
-  // Zero-byte request is a no-op
-  Check(FCompute.EnsureStagingCapacity(0),
-    'EnsureStagingCapacity(0) returns True');
+  // Zero-arg requests are no-ops
+  Check(FCompute.EnsureStagingPool(0, CBytesSmall),
+    'EnsureStagingPool(0, bytes) returns True');
+  Check(FCompute.EnsureStagingPool(CCountSmall, 0),
+    'EnsureStagingPool(count, 0) returns True');
   Check(FCompute.GetStagingCapacity() = 0,
-    'Capacity still 0 after EnsureStagingCapacity(0)');
+    'Capacity still 0 after zero-arg calls');
+  Check(FCompute.GetStagingCount() = 0,
+    'Count still 0 after zero-arg calls');
   FlushErrors(FCompute.GetErrors());
 
-  // First real grow
-  Check(FCompute.EnsureStagingCapacity(CSmall),
-    'EnsureStagingCapacity(CSmall) grows pool');
-  Check(FCompute.GetStagingCapacity() = CSmall,
-    'Capacity == CSmall after first grow');
-  Check(FCompute.GetStagingHost().Buffer <> VK_NULL_HANDLE,
-    'Host handle allocated');
-  Check(FCompute.GetStagingDevice().Buffer <> VK_NULL_HANDLE,
-    'Device handle allocated');
-  Check(FCompute.GetStagingHost().Size = CSmall,
-    'Host buffer size == CSmall');
-  Check(FCompute.GetStagingDevice().Size = CSmall,
-    'Device buffer size == CSmall');
+  // First real grow: 2 pairs × 1024 bytes
+  Check(FCompute.EnsureStagingPool(CCountSmall, CBytesSmall),
+    'EnsureStagingPool(2, CBytesSmall) grows pool');
+  Check(FCompute.GetStagingCount() = CCountSmall,
+    'Count == 2 after first grow');
+  Check(FCompute.GetStagingCapacity() = CBytesSmall,
+    'Capacity == CBytesSmall after first grow');
+  Check(FCompute.GetStagingHost(0).Buffer <> VK_NULL_HANDLE,
+    'Host[0] allocated');
+  Check(FCompute.GetStagingHost(1).Buffer <> VK_NULL_HANDLE,
+    'Host[1] allocated');
+  Check(FCompute.GetStagingDevice(0).Buffer <> VK_NULL_HANDLE,
+    'Device[0] allocated');
+  Check(FCompute.GetStagingDevice(1).Buffer <> VK_NULL_HANDLE,
+    'Device[1] allocated');
+  Check(FCompute.GetStagingHost(0).Size = CBytesSmall,
+    'Host[0] size == CBytesSmall');
+  Check(FCompute.GetStagingDevice(0).Size = CBytesSmall,
+    'Device[0] size == CBytesSmall');
   FlushErrors(FCompute.GetErrors());
 
-  LHostAfterSmall   := FCompute.GetStagingHost().Buffer;
-  LDeviceAfterSmall := FCompute.GetStagingDevice().Buffer;
+  LHost0AfterSmall := FCompute.GetStagingHost(0).Buffer;
+  LDev0AfterSmall  := FCompute.GetStagingDevice(0).Buffer;
 
-  // Request smaller than current — no-op, handles unchanged
-  Check(FCompute.EnsureStagingCapacity(CSmall div 2),
-    'EnsureStagingCapacity(smaller) returns True');
-  Check(FCompute.GetStagingCapacity() = CSmall,
-    'Capacity unchanged when requesting smaller');
-  Check(FCompute.GetStagingHost().Buffer = LHostAfterSmall,
-    'Host handle unchanged (no realloc)');
-  Check(FCompute.GetStagingDevice().Buffer = LDeviceAfterSmall,
-    'Device handle unchanged (no realloc)');
+  // Smaller request — no-op, handles unchanged
+  Check(FCompute.EnsureStagingPool(1, CBytesSmall div 2),
+    'EnsureStagingPool(smaller count + smaller bytes) returns True');
+  Check(FCompute.GetStagingCount() = CCountSmall,
+    'Count unchanged when smaller requested');
+  Check(FCompute.GetStagingCapacity() = CBytesSmall,
+    'Capacity unchanged when smaller requested');
+  Check(FCompute.GetStagingHost(0).Buffer = LHost0AfterSmall,
+    'Host[0] handle unchanged (no realloc)');
+  Check(FCompute.GetStagingDevice(0).Buffer = LDev0AfterSmall,
+    'Device[0] handle unchanged (no realloc)');
   FlushErrors(FCompute.GetErrors());
 
-  // Grow
-  Check(FCompute.EnsureStagingCapacity(CLarge),
-    'EnsureStagingCapacity(CLarge) grows pool');
-  Check(FCompute.GetStagingCapacity() = CLarge,
-    'Capacity == CLarge after grow');
-  Check(FCompute.GetStagingHost().Size = CLarge,
-    'Host buffer size == CLarge after grow');
-  Check(FCompute.GetStagingDevice().Size = CLarge,
-    'Device buffer size == CLarge after grow');
-  Check(FCompute.GetStagingHost().Buffer <> LHostAfterSmall,
-    'Host handle replaced after grow');
-  Check(FCompute.GetStagingDevice().Buffer <> LDeviceAfterSmall,
-    'Device handle replaced after grow');
+  // Grow both count and bytes
+  Check(FCompute.EnsureStagingPool(CCountLarge, CBytesLarge),
+    'EnsureStagingPool(4, CBytesLarge) grows pool');
+  Check(FCompute.GetStagingCount() = CCountLarge,
+    'Count == 4 after grow');
+  Check(FCompute.GetStagingCapacity() = CBytesLarge,
+    'Capacity == CBytesLarge after grow');
+  Check(FCompute.GetStagingHost(3).Size = CBytesLarge,
+    'Host[3] size == CBytesLarge after grow');
+  Check(FCompute.GetStagingDevice(3).Size = CBytesLarge,
+    'Device[3] size == CBytesLarge after grow');
+  Check(FCompute.GetStagingHost(0).Buffer <> LHost0AfterSmall,
+    'Host[0] handle replaced after grow');
   FlushErrors(FCompute.GetErrors());
 
-  // Functional data-path roundtrip: fill host staging from a pattern,
-  // copy host -> device, then copy device -> scratch host-visible,
-  // download, verify bytes. Mirrors what TVdxAttention will do.
-  SetLength(LSrcBytes, CLarge);
-  SetLength(LDstBytes, CLarge);
-  for LI := 0 to Integer(CLarge) - 1 do
+  // Functional data-path roundtrip on pair index 2 (proves non-zero
+  // indices work, not just pair 0). Mirrors what TVdxAttention will
+  // do for each of Q/K/V/O.
+  SetLength(LSrcBytes, CBytesLarge);
+  SetLength(LDstBytes, CBytesLarge);
+  for LI := 0 to Integer(CBytesLarge) - 1 do
     LSrcBytes[LI] := Byte((LI * 7 + 23) and $FF);
 
-  LScratch := FCompute.CreateGpuBuffer(CLarge,
+  LScratch := FCompute.CreateGpuBuffer(CBytesLarge,
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
     vcBuffer);
   try
     FlushErrors(FCompute.GetErrors());
-    Check(FCompute.UploadToBuffer(FCompute.GetStagingHost(),
-      @LSrcBytes[0], CLarge),
-      'Upload pattern into staging host');
-    Check(FCompute.CopyBuffer(FCompute.GetStagingHost(),
-      FCompute.GetStagingDevice(), CLarge),
-      'CopyBuffer host -> device');
-    Check(FCompute.CopyBuffer(FCompute.GetStagingDevice(),
-      LScratch, CLarge),
-      'CopyBuffer device -> scratch');
-    Check(FCompute.DownloadFromBuffer(LScratch, @LDstBytes[0], CLarge),
+    Check(FCompute.UploadToBuffer(FCompute.GetStagingHost(2),
+      @LSrcBytes[0], CBytesLarge),
+      'Upload pattern into staging host pair[2]');
+    Check(FCompute.CopyBuffer(FCompute.GetStagingHost(2),
+      FCompute.GetStagingDevice(2), CBytesLarge),
+      'CopyBuffer host[2] -> device[2]');
+    Check(FCompute.CopyBuffer(FCompute.GetStagingDevice(2),
+      LScratch, CBytesLarge),
+      'CopyBuffer device[2] -> scratch');
+    Check(FCompute.DownloadFromBuffer(LScratch, @LDstBytes[0], CBytesLarge),
       'Download scratch');
     FlushErrors(FCompute.GetErrors());
 
     LMatches := True;
-    for LI := 0 to Integer(CLarge) - 1 do
+    for LI := 0 to Integer(CBytesLarge) - 1 do
       if LDstBytes[LI] <> LSrcBytes[LI] then
       begin
         LMatches := False;

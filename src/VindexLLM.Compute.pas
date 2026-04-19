@@ -179,15 +179,17 @@ type
     FBatchDeferredPools:     array of VkDescriptorPool;
     FBatchDeferredPoolCount: Integer;
 
-    // Shared streaming-staging pool — a single host-visible +
-    // device-local buffer pair that consumers (TVdxAttention,
-    // TVdxFFN, ...) borrow at dispatch time to stream tensor slices
-    // from the mmap'd GGUF into VRAM. Grown on demand via
-    // EnsureStagingCapacity; never shrinks. Lifetime is tied to
-    // this TVdxCompute instance.
-    FStagingHost:     TVdxGpuBuffer;
-    FStagingDevice:   TVdxGpuBuffer;
+    // Shared streaming-staging pool — N host-visible + N device-local
+    // buffer pairs that consumers (TVdxAttention, TVdxFFN, ...) borrow
+    // at dispatch time to stream tensor slices from the mmap'd GGUF
+    // into VRAM. One pair per concurrent in-flight slice within a
+    // batch — e.g. Attention uses 4 (Q/K/V/O), FFN uses 3 (gate/up/
+    // down). Grown on demand via EnsureStagingPool; never shrinks.
+    // Lifetime is tied to this TVdxCompute instance.
+    FStagingHosts:    TArray<TVdxGpuBuffer>;
+    FStagingDevices:  TArray<TVdxGpuBuffer>;
     FStagingCapacity: UInt64;
+    FStagingCount:    UInt32;
 
     // Device info (populated once physical device is selected)
     FDeviceProperties: VkPhysicalDeviceProperties;
@@ -331,23 +333,24 @@ type
       const ADst: TVdxGpuBuffer;
       const ADstOffset, ASize: VkDeviceSize): Boolean;
 
-    // Streaming-staging pool — one shared host+device buffer pair
-    // used by consumers to stream tensor slices from the mmap'd
-    // GGUF into VRAM. Consumers call EnsureStagingCapacity(MaxBytes)
-    // during their own Init with the largest slice they'll ever
-    // upload. The pool grows to max(current, MaxBytes) and never
-    // shrinks. First call allocates; later calls that fit inside
-    // the current capacity are no-ops. Returns False with FErrors
-    // populated (via underlying CreateGpuBuffer) on failure.
-    function  EnsureStagingCapacity(const ABytes: UInt64): Boolean;
-    // Borrow handles for a streamed upload: fill StagingHost via
-    // UploadToBuffer, CopyBuffer(StagingHost -> StagingDevice),
-    // BatchBarrier, dispatch against StagingDevice. Both handles
-    // are valid only after at least one successful
-    // EnsureStagingCapacity call.
-    function  GetStagingHost(): TVdxGpuBuffer;
-    function  GetStagingDevice(): TVdxGpuBuffer;
+    // Streaming-staging pool — N host+device buffer pairs used by
+    // consumers to stream tensor slices from the mmap'd GGUF into
+    // VRAM. Consumers call EnsureStagingPool(count, bytes) during
+    // their own Init with the number of concurrent slices they need
+    // per batched forward call and the largest slice size. The pool
+    // grows to max(current_count, count) pairs each of
+    // max(current_bytes, bytes) — never shrinks. Returns False with
+    // FErrors populated (via underlying CreateGpuBuffer) on failure.
+    function  EnsureStagingPool(const ACount: UInt32;
+      const ABytesPerPair: UInt64): Boolean;
+    // Borrow handles for one streamed upload. AIndex must be in
+    // [0, GetStagingCount). Typical Attention forward uses indices
+    // 0..3 for Q/K/V/O, all in flight within one batch. Valid only
+    // after at least one successful EnsureStagingPool call.
+    function  GetStagingHost(const AIndex: UInt32): TVdxGpuBuffer;
+    function  GetStagingDevice(const AIndex: UInt32): TVdxGpuBuffer;
     function  GetStagingCapacity(): UInt64;
+    function  GetStagingCount(): UInt32;
 
     // Shader + pipeline
     function  CreateShaderModule(const ACode: Pointer;
@@ -440,9 +443,10 @@ begin
   FBatchMode              := False;
   FBatchDeferredPoolCount := 0;
 
-  FStagingHost     := Default(TVdxGpuBuffer);
-  FStagingDevice   := Default(TVdxGpuBuffer);
   FStagingCapacity := 0;
+  FStagingCount    := 0;
+  SetLength(FStagingHosts, 0);
+  SetLength(FStagingDevices, 0);
 
   FSelectedGpuIndex := -1;
 
@@ -462,10 +466,16 @@ begin
       FvkQueueWaitIdle(FComputeQueue);
 
     // Free streaming-staging pool while the device is still alive.
-    if FStagingCapacity > 0 then
+    if FStagingCount > 0 then
     begin
-      DestroyGpuBuffer(FStagingHost);
-      DestroyGpuBuffer(FStagingDevice);
+      for var LI := 0 to Integer(FStagingCount) - 1 do
+      begin
+        DestroyGpuBuffer(FStagingHosts[LI]);
+        DestroyGpuBuffer(FStagingDevices[LI]);
+      end;
+      SetLength(FStagingHosts, 0);
+      SetLength(FStagingDevices, 0);
+      FStagingCount    := 0;
       FStagingCapacity := 0;
     end;
 
@@ -1328,72 +1338,122 @@ end;
 //  Streaming staging pool
 // ============================================================================
 
-function TVdxCompute.EnsureStagingCapacity(const ABytes: UInt64): Boolean;
+function TVdxCompute.EnsureStagingPool(const ACount: UInt32;
+  const ABytesPerPair: UInt64): Boolean;
 var
-  LNewHost:   TVdxGpuBuffer;
-  LNewDevice: TVdxGpuBuffer;
+  LNewCount: UInt32;
+  LNewBytes: UInt64;
+  LNewHosts:   TArray<TVdxGpuBuffer>;
+  LNewDevices: TArray<TVdxGpuBuffer>;
+  LI: Integer;
+  LFailed: Boolean;
 begin
   Result := False;
 
-  if ABytes = 0 then
+  if (ACount = 0) or (ABytesPerPair = 0) then
   begin
     Result := True;
     Exit;
   end;
 
-  if ABytes <= FStagingCapacity then
+  if ACount > FStagingCount then
+    LNewCount := ACount
+  else
+    LNewCount := FStagingCount;
+  if ABytesPerPair > FStagingCapacity then
+    LNewBytes := ABytesPerPair
+  else
+    LNewBytes := FStagingCapacity;
+
+  if (LNewCount = FStagingCount) and (LNewBytes = FStagingCapacity) then
   begin
     Result := True;
     Exit;
   end;
 
-  // Allocate the new pair first; only destroy the old pair on
-  // success so a failed grow leaves the pool in its previous good
-  // state. Underlying CreateGpuBuffer populates FErrors on failure.
-  LNewHost := CreateGpuBuffer(
-    ABytes,
-    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or
-    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-    vcBuffer);
-  if FErrors.HasFatal() then Exit;
+  // Allocate new pool first; only destroy old on success so a failed
+  // grow leaves the pool in its previous good state. Underlying
+  // CreateGpuBuffer populates FErrors on failure.
+  SetLength(LNewHosts, LNewCount);
+  SetLength(LNewDevices, LNewCount);
+  LFailed := False;
 
-  LNewDevice := CreateGpuBuffer(
-    ABytes,
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-    vcBuffer);
-  if FErrors.HasFatal() then
+  for LI := 0 to Integer(LNewCount) - 1 do
   begin
-    DestroyGpuBuffer(LNewHost);
+    LNewHosts[LI] := CreateGpuBuffer(
+      LNewBytes,
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      vcBuffer);
+    if FErrors.HasFatal() then
+    begin
+      LFailed := True;
+      Break;
+    end;
+
+    LNewDevices[LI] := CreateGpuBuffer(
+      LNewBytes,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      vcBuffer);
+    if FErrors.HasFatal() then
+    begin
+      LFailed := True;
+      Break;
+    end;
+  end;
+
+  if LFailed then
+  begin
+    for LI := 0 to High(LNewHosts) do
+    begin
+      if LNewHosts[LI].Buffer <> VK_NULL_HANDLE then
+        DestroyGpuBuffer(LNewHosts[LI]);
+      if LNewDevices[LI].Buffer <> VK_NULL_HANDLE then
+        DestroyGpuBuffer(LNewDevices[LI]);
+    end;
     Exit;
   end;
 
-  if FStagingCapacity > 0 then
+  // Commit: destroy old pool, install new.
+  for LI := 0 to Integer(FStagingCount) - 1 do
   begin
-    DestroyGpuBuffer(FStagingHost);
-    DestroyGpuBuffer(FStagingDevice);
+    DestroyGpuBuffer(FStagingHosts[LI]);
+    DestroyGpuBuffer(FStagingDevices[LI]);
   end;
-
-  FStagingHost     := LNewHost;
-  FStagingDevice   := LNewDevice;
-  FStagingCapacity := ABytes;
+  FStagingHosts    := LNewHosts;
+  FStagingDevices  := LNewDevices;
+  FStagingCount    := LNewCount;
+  FStagingCapacity := LNewBytes;
   Result := True;
 end;
 
-function TVdxCompute.GetStagingHost(): TVdxGpuBuffer;
+function TVdxCompute.GetStagingHost(const AIndex: UInt32): TVdxGpuBuffer;
 begin
-  Result := FStagingHost;
+  if AIndex < FStagingCount then
+    Result := FStagingHosts[AIndex]
+  else
+    Result := Default(TVdxGpuBuffer);
 end;
 
-function TVdxCompute.GetStagingDevice(): TVdxGpuBuffer;
+function TVdxCompute.GetStagingDevice(const AIndex: UInt32): TVdxGpuBuffer;
 begin
-  Result := FStagingDevice;
+  if AIndex < FStagingCount then
+    Result := FStagingDevices[AIndex]
+  else
+    Result := Default(TVdxGpuBuffer);
 end;
 
 function TVdxCompute.GetStagingCapacity(): UInt64;
 begin
   Result := FStagingCapacity;
+end;
+
+function TVdxCompute.GetStagingCount(): UInt32;
+begin
+  Result := FStagingCount;
 end;
 
 // ============================================================================

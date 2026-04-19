@@ -123,6 +123,17 @@ resourcestring
   RSLNTensorWrongType  = 'LayerNorm: tensor %s expected F32 but got %s';
   RSLNUploadException  = 'LayerNorm: UploadNormWeights raised exception: %s';
 
+  //--------------------------------------------------------------------------
+  // Attention (TVdxAttention) Messages
+  //--------------------------------------------------------------------------
+  RSAttnComputeNil       = 'Attention.Init: ACompute is nil';
+  RSAttnAlreadyInit      = 'Attention: already initialized';
+  RSAttnNotInit          = 'Attention: not initialized (call Init first)';
+  RSAttnInitException    = 'Attention: Init raised exception: %s';
+  RSAttnResolveException = 'Attention: ResolveAttnWeights raised exception: %s';
+  RSAttnTensorNotFound   = 'Attention: GGUF tensor not found: %s';
+  RSAttnUnsupportedType  = 'Attention: unsupported tensor type for %s: %s';
+
 implementation
 
 end.
