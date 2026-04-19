@@ -102,6 +102,16 @@ resourcestring
   RSGGNoDataBase         = 'GGUF file not open or tensor data base not computed';
   RSGGParseException     = 'GGUF parse raised exception: %s';
 
+  //--------------------------------------------------------------------------
+  // Tokenizer (TVdxTokenizer) Messages
+  //--------------------------------------------------------------------------
+  RSTKNilReader      = 'Tokenizer: reader is nil';
+  RSTKReaderNotOpen  = 'Tokenizer: reader is not open (call TVdxGGUFReader.Open first)';
+  RSTKMissingTokens  = 'Tokenizer: metadata key ''tokenizer.ggml.tokens'' not found';
+  RSTKTokensNotArray = 'Tokenizer: ''tokenizer.ggml.tokens'' has wrong type (got %d, expected array)';
+  RSTKMissingScores  = 'Tokenizer: metadata key ''tokenizer.ggml.scores'' not found — BPE cannot merge without scores';
+  RSTKMissingTypes   = 'Tokenizer: metadata key ''tokenizer.ggml.token_type'' not found — special tokens cannot be identified';
+
 implementation
 
 end.
