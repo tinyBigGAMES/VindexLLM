@@ -134,6 +134,17 @@ resourcestring
   RSAttnTensorNotFound   = 'Attention: GGUF tensor not found: %s';
   RSAttnUnsupportedType  = 'Attention: unsupported tensor type for %s: %s';
 
+  //--------------------------------------------------------------------------
+  // FFN (TVdxFFN) Messages
+  //--------------------------------------------------------------------------
+  RSFFNComputeNil       = 'FFN.Init: ACompute is nil';
+  RSFFNAlreadyInit      = 'FFN: already initialized';
+  RSFFNNotInit          = 'FFN: not initialized (call Init first)';
+  RSFFNInitException    = 'FFN: Init raised exception: %s';
+  RSFFNResolveException = 'FFN: ResolveFFNWeights raised exception: %s';
+  RSFFNTensorNotFound   = 'FFN: GGUF tensor not found: %s';
+  RSFFNUnsupportedType  = 'FFN: unsupported tensor type for %s: %s';
+
 implementation
 
 end.

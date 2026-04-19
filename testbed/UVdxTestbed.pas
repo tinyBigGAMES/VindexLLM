@@ -28,7 +28,8 @@ uses
   UTest.GGUFReader,
   UTest.Tokenizer,
   UTest.LayerNorm,
-  UTest.Attention;
+  UTest.Attention,
+  UTest.FFNWeights;
 
 // ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
@@ -43,7 +44,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start...');
 
-    LIndex := 7;
+    LIndex := 8;
 
     case LIndex of
       1: VdxRunTestCase(TVirtualBufferTest);
@@ -53,6 +54,7 @@ begin
       5: VdxRunTestCase(TTokenizerTest);
       6: VdxRunTestCase(TLayerNormTest);
       7: VdxRunTestCase(TAttentionTest);
+      8: VdxRunTestCase(TFFNWeightsTest);
     end;
   except
     on E: Exception do
