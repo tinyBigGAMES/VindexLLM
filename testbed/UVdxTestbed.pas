@@ -29,7 +29,8 @@ uses
   UTest.Tokenizer,
   UTest.LayerNorm,
   UTest.Attention,
-  UTest.FFNWeights;
+  UTest.FFNWeights,
+  UTest.TurboQuant;
 
 // ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
@@ -44,7 +45,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start...');
 
-    LIndex := 8;
+    LIndex := 9;
 
     case LIndex of
       1: VdxRunTestCase(TVirtualBufferTest);
@@ -55,6 +56,7 @@ begin
       6: VdxRunTestCase(TLayerNormTest);
       7: VdxRunTestCase(TAttentionTest);
       8: VdxRunTestCase(TFFNWeightsTest);
+      9: VdxRunTestCase(TTurboQuantTest);
     end;
   except
     on E: Exception do

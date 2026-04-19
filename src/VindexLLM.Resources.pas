@@ -145,6 +145,14 @@ resourcestring
   RSFFNTensorNotFound   = 'FFN: GGUF tensor not found: %s';
   RSFFNUnsupportedType  = 'FFN: unsupported tensor type for %s: %s';
 
+  //--------------------------------------------------------------------------
+  // TurboQuant (TVdxTurboQuant) Messages
+  //--------------------------------------------------------------------------
+  RSTQComputeNil        = 'TurboQuant.Init: ACompute is nil';
+  RSTQAlreadyInit       = 'TurboQuant: already initialized';
+  RSTQNotInit           = 'TurboQuant: not initialized (call Init first)';
+  RSTQInitException     = 'TurboQuant: Init raised exception: %s';
+
 implementation
 
 end.
