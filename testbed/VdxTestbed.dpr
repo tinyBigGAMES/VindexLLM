@@ -34,6 +34,8 @@ uses
   VindexLLM.FFNWeights in '..\src\VindexLLM.FFNWeights.pas',
   VindexLLM.GGUFReader in '..\src\VindexLLM.GGUFReader.pas',
   VindexLLM.LayerNorm in '..\src\VindexLLM.LayerNorm.pas',
+  VindexLLM.Model in '..\src\VindexLLM.Model.pas',
+  VindexLLM.Model.Registry in '..\src\VindexLLM.Model.Registry.pas',
   VindexLLM.Resources in '..\src\VindexLLM.Resources.pas',
   VindexLLM.Sampler in '..\src\VindexLLM.Sampler.pas',
   VindexLLM.Shaders in '..\src\VindexLLM.Shaders.pas',

@@ -126,6 +126,8 @@
         <DCCReference Include="..\src\VindexLLM.FFNWeights.pas"/>
         <DCCReference Include="..\src\VindexLLM.GGUFReader.pas"/>
         <DCCReference Include="..\src\VindexLLM.LayerNorm.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Model.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Model.Registry.pas"/>
         <DCCReference Include="..\src\VindexLLM.Resources.pas"/>
         <DCCReference Include="..\src\VindexLLM.Sampler.pas"/>
         <DCCReference Include="..\src\VindexLLM.Shaders.pas"/>
