@@ -179,6 +179,16 @@ type
     FBatchDeferredPools:     array of VkDescriptorPool;
     FBatchDeferredPoolCount: Integer;
 
+    // Shared streaming-staging pool — a single host-visible +
+    // device-local buffer pair that consumers (TVdxAttention,
+    // TVdxFFN, ...) borrow at dispatch time to stream tensor slices
+    // from the mmap'd GGUF into VRAM. Grown on demand via
+    // EnsureStagingCapacity; never shrinks. Lifetime is tied to
+    // this TVdxCompute instance.
+    FStagingHost:     TVdxGpuBuffer;
+    FStagingDevice:   TVdxGpuBuffer;
+    FStagingCapacity: UInt64;
+
     // Device info (populated once physical device is selected)
     FDeviceProperties: VkPhysicalDeviceProperties;
     FMemoryProperties: VkPhysicalDeviceMemoryProperties;
@@ -321,6 +331,24 @@ type
       const ADst: TVdxGpuBuffer;
       const ADstOffset, ASize: VkDeviceSize): Boolean;
 
+    // Streaming-staging pool — one shared host+device buffer pair
+    // used by consumers to stream tensor slices from the mmap'd
+    // GGUF into VRAM. Consumers call EnsureStagingCapacity(MaxBytes)
+    // during their own Init with the largest slice they'll ever
+    // upload. The pool grows to max(current, MaxBytes) and never
+    // shrinks. First call allocates; later calls that fit inside
+    // the current capacity are no-ops. Returns False with FErrors
+    // populated (via underlying CreateGpuBuffer) on failure.
+    function  EnsureStagingCapacity(const ABytes: UInt64): Boolean;
+    // Borrow handles for a streamed upload: fill StagingHost via
+    // UploadToBuffer, CopyBuffer(StagingHost -> StagingDevice),
+    // BatchBarrier, dispatch against StagingDevice. Both handles
+    // are valid only after at least one successful
+    // EnsureStagingCapacity call.
+    function  GetStagingHost(): TVdxGpuBuffer;
+    function  GetStagingDevice(): TVdxGpuBuffer;
+    function  GetStagingCapacity(): UInt64;
+
     // Shader + pipeline
     function  CreateShaderModule(const ACode: Pointer;
       const ACodeSize: NativeUInt): VkShaderModule;
@@ -412,6 +440,10 @@ begin
   FBatchMode              := False;
   FBatchDeferredPoolCount := 0;
 
+  FStagingHost     := Default(TVdxGpuBuffer);
+  FStagingDevice   := Default(TVdxGpuBuffer);
+  FStagingCapacity := 0;
+
   FSelectedGpuIndex := -1;
 
   FVRAMWeightsBytes := 0;
@@ -428,6 +460,14 @@ begin
   begin
     if Assigned(FvkQueueWaitIdle) then
       FvkQueueWaitIdle(FComputeQueue);
+
+    // Free streaming-staging pool while the device is still alive.
+    if FStagingCapacity > 0 then
+    begin
+      DestroyGpuBuffer(FStagingHost);
+      DestroyGpuBuffer(FStagingDevice);
+      FStagingCapacity := 0;
+    end;
 
     if FFence <> VK_NULL_HANDLE then
       FvkDestroyFence(FDevice, FFence, nil);
@@ -1282,6 +1322,78 @@ begin
     'Wait for copy-region fence (vkWaitForFences)') then Exit;
 
   Result := True;
+end;
+
+// ============================================================================
+//  Streaming staging pool
+// ============================================================================
+
+function TVdxCompute.EnsureStagingCapacity(const ABytes: UInt64): Boolean;
+var
+  LNewHost:   TVdxGpuBuffer;
+  LNewDevice: TVdxGpuBuffer;
+begin
+  Result := False;
+
+  if ABytes = 0 then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  if ABytes <= FStagingCapacity then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  // Allocate the new pair first; only destroy the old pair on
+  // success so a failed grow leaves the pool in its previous good
+  // state. Underlying CreateGpuBuffer populates FErrors on failure.
+  LNewHost := CreateGpuBuffer(
+    ABytes,
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or
+    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    vcBuffer);
+  if FErrors.HasFatal() then Exit;
+
+  LNewDevice := CreateGpuBuffer(
+    ABytes,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    vcBuffer);
+  if FErrors.HasFatal() then
+  begin
+    DestroyGpuBuffer(LNewHost);
+    Exit;
+  end;
+
+  if FStagingCapacity > 0 then
+  begin
+    DestroyGpuBuffer(FStagingHost);
+    DestroyGpuBuffer(FStagingDevice);
+  end;
+
+  FStagingHost     := LNewHost;
+  FStagingDevice   := LNewDevice;
+  FStagingCapacity := ABytes;
+  Result := True;
+end;
+
+function TVdxCompute.GetStagingHost(): TVdxGpuBuffer;
+begin
+  Result := FStagingHost;
+end;
+
+function TVdxCompute.GetStagingDevice(): TVdxGpuBuffer;
+begin
+  Result := FStagingDevice;
+end;
+
+function TVdxCompute.GetStagingCapacity(): UInt64;
+begin
+  Result := FStagingCapacity;
 end;
 
 // ============================================================================

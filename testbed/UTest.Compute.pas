@@ -36,6 +36,7 @@ type
     procedure SecMapPersistent();
     procedure SecVRAMAccounting();
     procedure SecCopyBuffer();
+    procedure SecStreamingStagingPool();
     procedure SecShaderModuleLifecycle();
     procedure SecPipelineBuildAndDispatch();
     procedure SecBatchMode();
@@ -80,6 +81,7 @@ begin
   SecMapPersistent();
   SecVRAMAccounting();
   SecCopyBuffer();
+  SecStreamingStagingPool();
   SecShaderModuleLifecycle();
   SecPipelineBuildAndDispatch();
   SecBatchMode();
@@ -441,6 +443,128 @@ begin
   finally
     FCompute.DestroyGpuBuffer(LSrc);
     FCompute.DestroyGpuBuffer(LDst);
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// SecStreamingStagingPool — lifecycle + grow semantics of the shared
+// staging pool owned by TVdxCompute, plus a functional data-path
+// roundtrip that mirrors what TVdxAttention / TVdxFFN will do: fill
+// staging host, CopyBuffer host -> device, then read back via a
+// scratch buffer to prove bytes survived the round trip.
+// ---------------------------------------------------------------------------
+procedure TComputeTest.SecStreamingStagingPool();
+const
+  CSmall: UInt64 = 1024;
+  CLarge: UInt64 = 4096;
+var
+  LSrcBytes: TBytes;
+  LDstBytes: TBytes;
+  LScratch:  TVdxGpuBuffer;
+  LHostAfterSmall:   VkBuffer;
+  LDeviceAfterSmall: VkBuffer;
+  LI: Integer;
+  LMatches: Boolean;
+begin
+  Section('Streaming staging pool');
+
+  // Initial state
+  Check(FCompute.GetStagingCapacity() = 0,
+    'Capacity 0 before first EnsureStagingCapacity');
+  Check(FCompute.GetStagingHost().Buffer = VK_NULL_HANDLE,
+    'Host handle null before first EnsureStagingCapacity');
+  Check(FCompute.GetStagingDevice().Buffer = VK_NULL_HANDLE,
+    'Device handle null before first EnsureStagingCapacity');
+
+  // Zero-byte request is a no-op
+  Check(FCompute.EnsureStagingCapacity(0),
+    'EnsureStagingCapacity(0) returns True');
+  Check(FCompute.GetStagingCapacity() = 0,
+    'Capacity still 0 after EnsureStagingCapacity(0)');
+  FlushErrors(FCompute.GetErrors());
+
+  // First real grow
+  Check(FCompute.EnsureStagingCapacity(CSmall),
+    'EnsureStagingCapacity(CSmall) grows pool');
+  Check(FCompute.GetStagingCapacity() = CSmall,
+    'Capacity == CSmall after first grow');
+  Check(FCompute.GetStagingHost().Buffer <> VK_NULL_HANDLE,
+    'Host handle allocated');
+  Check(FCompute.GetStagingDevice().Buffer <> VK_NULL_HANDLE,
+    'Device handle allocated');
+  Check(FCompute.GetStagingHost().Size = CSmall,
+    'Host buffer size == CSmall');
+  Check(FCompute.GetStagingDevice().Size = CSmall,
+    'Device buffer size == CSmall');
+  FlushErrors(FCompute.GetErrors());
+
+  LHostAfterSmall   := FCompute.GetStagingHost().Buffer;
+  LDeviceAfterSmall := FCompute.GetStagingDevice().Buffer;
+
+  // Request smaller than current — no-op, handles unchanged
+  Check(FCompute.EnsureStagingCapacity(CSmall div 2),
+    'EnsureStagingCapacity(smaller) returns True');
+  Check(FCompute.GetStagingCapacity() = CSmall,
+    'Capacity unchanged when requesting smaller');
+  Check(FCompute.GetStagingHost().Buffer = LHostAfterSmall,
+    'Host handle unchanged (no realloc)');
+  Check(FCompute.GetStagingDevice().Buffer = LDeviceAfterSmall,
+    'Device handle unchanged (no realloc)');
+  FlushErrors(FCompute.GetErrors());
+
+  // Grow
+  Check(FCompute.EnsureStagingCapacity(CLarge),
+    'EnsureStagingCapacity(CLarge) grows pool');
+  Check(FCompute.GetStagingCapacity() = CLarge,
+    'Capacity == CLarge after grow');
+  Check(FCompute.GetStagingHost().Size = CLarge,
+    'Host buffer size == CLarge after grow');
+  Check(FCompute.GetStagingDevice().Size = CLarge,
+    'Device buffer size == CLarge after grow');
+  Check(FCompute.GetStagingHost().Buffer <> LHostAfterSmall,
+    'Host handle replaced after grow');
+  Check(FCompute.GetStagingDevice().Buffer <> LDeviceAfterSmall,
+    'Device handle replaced after grow');
+  FlushErrors(FCompute.GetErrors());
+
+  // Functional data-path roundtrip: fill host staging from a pattern,
+  // copy host -> device, then copy device -> scratch host-visible,
+  // download, verify bytes. Mirrors what TVdxAttention will do.
+  SetLength(LSrcBytes, CLarge);
+  SetLength(LDstBytes, CLarge);
+  for LI := 0 to Integer(CLarge) - 1 do
+    LSrcBytes[LI] := Byte((LI * 7 + 23) and $FF);
+
+  LScratch := FCompute.CreateGpuBuffer(CLarge,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    vcBuffer);
+  try
+    FlushErrors(FCompute.GetErrors());
+    Check(FCompute.UploadToBuffer(FCompute.GetStagingHost(),
+      @LSrcBytes[0], CLarge),
+      'Upload pattern into staging host');
+    Check(FCompute.CopyBuffer(FCompute.GetStagingHost(),
+      FCompute.GetStagingDevice(), CLarge),
+      'CopyBuffer host -> device');
+    Check(FCompute.CopyBuffer(FCompute.GetStagingDevice(),
+      LScratch, CLarge),
+      'CopyBuffer device -> scratch');
+    Check(FCompute.DownloadFromBuffer(LScratch, @LDstBytes[0], CLarge),
+      'Download scratch');
+    FlushErrors(FCompute.GetErrors());
+
+    LMatches := True;
+    for LI := 0 to Integer(CLarge) - 1 do
+      if LDstBytes[LI] <> LSrcBytes[LI] then
+      begin
+        LMatches := False;
+        Break;
+      end;
+    Check(LMatches,
+      'Round-tripped bytes match source pattern');
+  finally
+    FCompute.DestroyGpuBuffer(LScratch);
   end;
 end;
 
