@@ -112,6 +112,17 @@ resourcestring
   RSTKMissingScores  = 'Tokenizer: metadata key ''tokenizer.ggml.scores'' not found — BPE cannot merge without scores';
   RSTKMissingTypes   = 'Tokenizer: metadata key ''tokenizer.ggml.token_type'' not found — special tokens cannot be identified';
 
+  //--------------------------------------------------------------------------
+  // LayerNorm (TVdxLayerNorm) Messages
+  //--------------------------------------------------------------------------
+  RSLNNotInit          = 'LayerNorm: not initialized (call Init first)';
+  RSLNAlreadyInit      = 'LayerNorm: already initialized';
+  RSLNComputeNil       = 'LayerNorm.Init: ACompute is nil';
+  RSLNInitException    = 'LayerNorm: Init raised exception: %s';
+  RSLNTensorNotFound   = 'LayerNorm: GGUF tensor not found: %s';
+  RSLNTensorWrongType  = 'LayerNorm: tensor %s expected F32 but got %s';
+  RSLNUploadException  = 'LayerNorm: UploadNormWeights raised exception: %s';
+
 implementation
 
 end.
