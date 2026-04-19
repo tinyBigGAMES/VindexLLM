@@ -193,6 +193,10 @@ type
     function GetAlignment(): UInt32;
     function GetFileSize(): UInt64;
 
+    // True between a successful Open and the next Close (or Free).
+    // Cheap — tests whether the underlying memory-map is still live.
+    function IsOpen(): Boolean;
+
     // Metadata access. HasMetadata is a cheap pre-check. GetMetadata
     // returns True + populates AValue on hit, False + leaves AValue
     // zero-initialized on miss — missing keys are not errors, callers
@@ -833,6 +837,13 @@ end;
 function TVdxGGUFReader.GetFileSize(): UInt64;
 begin
   Result := FFileSize;
+end;
+
+function TVdxGGUFReader.IsOpen(): Boolean;
+begin
+  // FBasePtr is nil before Open and cleared by Close — non-nil
+  // exactly when the memory-map is live.
+  Result := FBasePtr <> nil;
 end;
 
 { Public API — metadata access }
