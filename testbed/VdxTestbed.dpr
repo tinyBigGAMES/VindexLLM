@@ -39,6 +39,7 @@ uses
   VindexLLM.Shaders in '..\src\VindexLLM.Shaders.pas',
   VindexLLM.TestCase in '..\src\VindexLLM.TestCase.pas',
   VindexLLM.Tokenizer in '..\src\VindexLLM.Tokenizer.pas',
+  VindexLLM.TokenWriter in '..\src\VindexLLM.TokenWriter.pas',
   VindexLLM.TOML in '..\src\VindexLLM.TOML.pas',
   VindexLLM.TurboQuant in '..\src\VindexLLM.TurboQuant.pas',
   VindexLLM.Utils in '..\src\VindexLLM.Utils.pas',

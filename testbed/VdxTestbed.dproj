@@ -131,6 +131,7 @@
         <DCCReference Include="..\src\VindexLLM.Shaders.pas"/>
         <DCCReference Include="..\src\VindexLLM.TestCase.pas"/>
         <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
+        <DCCReference Include="..\src\VindexLLM.TokenWriter.pas"/>
         <DCCReference Include="..\src\VindexLLM.TOML.pas"/>
         <DCCReference Include="..\src\VindexLLM.TurboQuant.pas"/>
         <DCCReference Include="..\src\VindexLLM.Utils.pas"/>
