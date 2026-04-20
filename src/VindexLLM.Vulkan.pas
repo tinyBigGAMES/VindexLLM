@@ -76,6 +76,9 @@ const
   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT  = $00000001;
   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT  = $00000002;
   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = $00000004;
+
+  // Memory heap flags
+  VK_MEMORY_HEAP_DEVICE_LOCAL_BIT      = $00000001;
   VK_MEMORY_PROPERTY_HOST_CACHED_BIT   = $00000008;
 
   // VkQueueFlagBits
@@ -130,26 +133,6 @@ const
 
   // Vulkan API version: 1.0.0
   VK_API_VERSION_1_0 = (1 shl 22) or (0 shl 12) or 0;
-
-  // Vulkan API version: 1.1.0 — required for VkPhysicalDeviceProperties2 /
-  // Features2 and the chainable per-feature property structs used by
-  // TVdxCompute.EnumerateGpus.
-  VK_API_VERSION_1_1 = (1 shl 22) or (1 shl 12) or 0;
-
-  // LUID size (bytes) — used by VkPhysicalDeviceIDProperties.deviceLUID.
-  VK_LUID_SIZE = 8;
-
-  // ---- VkStructureType additions (Vulkan 1.1 core + KHR fp16/int8) ----
-  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2                       = 1000059000;
-  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2                     = 1000059001;
-  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES                    = 1000071004;
-  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES              = 1000094000;
-  // FLOAT16_INT8 struct type — promoted from VK_KHR_shader_float16_int8
-  // (value 1000082000). On 1.2+ drivers it is core; on 1.1 drivers the
-  // extension must be available or the query returns VK_FALSE for both
-  // fields (safe fallback — TVdxGpuInfo.SupportsFp16/SupportsInt8 stay
-  // False when the feature is not advertised).
-  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR = 1000082000;
 
 // ============================================================================
 //  Vulkan Base Types
@@ -610,113 +593,6 @@ type
     dstAccessMask: VkFlags;
   end;
 
-  // ==========================================================================
-  //  Vulkan 1.1 physical-device query structs
-  //
-  //  VkPhysicalDeviceFeatures (55 VkBool32 fields) is fully declared even
-  //  though TVdxCompute currently reads only shaderFloat64, shaderInt64,
-  //  and shaderInt16 from it. The driver writes the full 220-byte payload
-  //  when vkGetPhysicalDeviceFeatures2 is called, so every field is
-  //  declared up front — lets later phases read additional features with
-  //  no binding-level rework.
-  // ==========================================================================
-
-  VkPhysicalDeviceFeatures = record
-    robustBufferAccess:                      VkBool32;
-    fullDrawIndexUint32:                     VkBool32;
-    imageCubeArray:                          VkBool32;
-    independentBlend:                        VkBool32;
-    geometryShader:                          VkBool32;
-    tessellationShader:                      VkBool32;
-    sampleRateShading:                       VkBool32;
-    dualSrcBlend:                            VkBool32;
-    logicOp:                                 VkBool32;
-    multiDrawIndirect:                       VkBool32;
-    drawIndirectFirstInstance:               VkBool32;
-    depthClamp:                              VkBool32;
-    depthBiasClamp:                          VkBool32;
-    fillModeNonSolid:                        VkBool32;
-    depthBounds:                             VkBool32;
-    wideLines:                               VkBool32;
-    largePoints:                             VkBool32;
-    alphaToOne:                              VkBool32;
-    multiViewport:                           VkBool32;
-    samplerAnisotropy:                       VkBool32;
-    textureCompressionETC2:                  VkBool32;
-    textureCompressionASTC_LDR:              VkBool32;
-    textureCompressionBC:                    VkBool32;
-    occlusionQueryPrecise:                   VkBool32;
-    pipelineStatisticsQuery:                 VkBool32;
-    vertexPipelineStoresAndAtomics:          VkBool32;
-    fragmentStoresAndAtomics:                VkBool32;
-    shaderTessellationAndGeometryPointSize:  VkBool32;
-    shaderImageGatherExtended:               VkBool32;
-    shaderStorageImageExtendedFormats:       VkBool32;
-    shaderStorageImageMultisample:           VkBool32;
-    shaderStorageImageReadWithoutFormat:     VkBool32;
-    shaderStorageImageWriteWithoutFormat:    VkBool32;
-    shaderUniformBufferArrayDynamicIndexing: VkBool32;
-    shaderSampledImageArrayDynamicIndexing:  VkBool32;
-    shaderStorageBufferArrayDynamicIndexing: VkBool32;
-    shaderStorageImageArrayDynamicIndexing:  VkBool32;
-    shaderClipDistance:                      VkBool32;
-    shaderCullDistance:                      VkBool32;
-    shaderFloat64:                           VkBool32;
-    shaderInt64:                             VkBool32;
-    shaderInt16:                             VkBool32;
-    shaderResourceResidency:                 VkBool32;
-    shaderResourceMinLod:                    VkBool32;
-    sparseBinding:                           VkBool32;
-    sparseResidencyBuffer:                   VkBool32;
-    sparseResidencyImage2D:                  VkBool32;
-    sparseResidencyImage3D:                  VkBool32;
-    sparseResidency2Samples:                 VkBool32;
-    sparseResidency4Samples:                 VkBool32;
-    sparseResidency8Samples:                 VkBool32;
-    sparseResidency16Samples:                VkBool32;
-    sparseResidencyAliased:                  VkBool32;
-    variableMultisampleRate:                 VkBool32;
-    inheritedQueries:                        VkBool32;
-  end;
-
-  VkPhysicalDeviceFeatures2 = record
-    sType:    VkStructureType;
-    pNext:    Pointer;
-    features: VkPhysicalDeviceFeatures;
-  end;
-
-  VkPhysicalDeviceProperties2 = record
-    sType:      VkStructureType;
-    pNext:      Pointer;
-    properties: VkPhysicalDeviceProperties;
-  end;
-
-  VkPhysicalDeviceIDProperties = record
-    sType:           VkStructureType;
-    pNext:           Pointer;
-    deviceUUID:      array[0..VK_UUID_SIZE - 1] of UInt8;
-    driverUUID:      array[0..VK_UUID_SIZE - 1] of UInt8;
-    deviceLUID:      array[0..VK_LUID_SIZE - 1] of UInt8;
-    deviceNodeMask:  UInt32;
-    deviceLUIDValid: VkBool32;
-  end;
-
-  VkPhysicalDeviceSubgroupProperties = record
-    sType:                     VkStructureType;
-    pNext:                     Pointer;
-    subgroupSize:              UInt32;
-    supportedStages:           VkFlags;
-    supportedOperations:       VkFlags;
-    quadOperationsInAllStages: VkBool32;
-  end;
-
-  VkPhysicalDeviceShaderFloat16Int8Features = record
-    sType:         VkStructureType;
-    pNext:         Pointer;
-    shaderFloat16: VkBool32;
-    shaderInt8:    VkBool32;
-  end;
-
 // ============================================================================
 //  Vulkan Function Pointer Types
 // ============================================================================
@@ -729,13 +605,6 @@ type
 
   TvkEnumeratePhysicalDevices = function(AInstance: VkInstance; var ACount: UInt32; ADevices: PVkPhysicalDevice): VkResult; stdcall;
   TvkGetPhysicalDeviceProperties = procedure(ADevice: VkPhysicalDevice; out AProperties: VkPhysicalDeviceProperties); stdcall;
-
-  // Vulkan 1.1 chained-query entry points — used by TVdxCompute.EnumerateGpus
-  // to read VkPhysicalDeviceIDProperties / SubgroupProperties / Float16Int8
-  // features. Resolved via vkGetInstanceProcAddr after instance creation;
-  // may be nil on 1.0-only drivers (caller must check before use).
-  TvkGetPhysicalDeviceProperties2 = procedure(ADevice: VkPhysicalDevice; var AProperties: VkPhysicalDeviceProperties2); stdcall;
-  TvkGetPhysicalDeviceFeatures2   = procedure(ADevice: VkPhysicalDevice; var AFeatures: VkPhysicalDeviceFeatures2); stdcall;
   TvkGetPhysicalDeviceQueueFamilyProperties = procedure(ADevice: VkPhysicalDevice; var ACount: UInt32; AProperties: PVkQueueFamilyProperties); stdcall;
   TvkGetPhysicalDeviceMemoryProperties = procedure(ADevice: VkPhysicalDevice; out AProperties: VkPhysicalDeviceMemoryProperties); stdcall;
 

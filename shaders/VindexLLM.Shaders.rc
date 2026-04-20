@@ -62,3 +62,6 @@ ATTN_SCORES_MH_TQ3          RCDATA "attn_scores_mh_tq3.spv"
 // Activation and residual
 GELU_MUL                RCDATA "gelu_mul.spv"
 VEC_ADD                 RCDATA "vec_add.spv"
+
+// Streaming PoC
+CHECKSUM                RCDATA "checksum.spv"

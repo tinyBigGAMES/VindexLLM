@@ -130,7 +130,7 @@ resourcestring
   RSAttnAlreadyInit      = 'Attention: already initialized';
   RSAttnNotInit          = 'Attention: not initialized (call Init first)';
   RSAttnInitException    = 'Attention: Init raised exception: %s';
-  RSAttnResolveException = 'Attention: ResolveAttnWeights raised exception: %s';
+  RSAttnResolveException = 'Attention: UploadAttnWeights raised exception: %s';
   RSAttnTensorNotFound   = 'Attention: GGUF tensor not found: %s';
   RSAttnUnsupportedType  = 'Attention: unsupported tensor type for %s: %s';
 
@@ -141,7 +141,7 @@ resourcestring
   RSFFNAlreadyInit      = 'FFN: already initialized';
   RSFFNNotInit          = 'FFN: not initialized (call Init first)';
   RSFFNInitException    = 'FFN: Init raised exception: %s';
-  RSFFNResolveException = 'FFN: ResolveFFNWeights raised exception: %s';
+  RSFFNResolveException = 'FFN: UploadFFNWeights raised exception: %s';
   RSFFNTensorNotFound   = 'FFN: GGUF tensor not found: %s';
   RSFFNUnsupportedType  = 'FFN: unsupported tensor type for %s: %s';
 

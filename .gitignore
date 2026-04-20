@@ -95,3 +95,8 @@ bin/session.kvc
 bin/session.db
 /src_ref
 testbed/UVdxTestbed_old1.pas
+bin/diag.txt
+bin/build.cmd
+/src_ref2
+/src_ref3
+/testbed - Copy

@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -51,10 +51,10 @@ uses
   System.Classes,
   System.Generics.Collections,
   VindexLLM.Utils,
-  VindexLLM.GGUFReader;
+  VindexLLM.GGUFReader,
+  UTest.Common;
 
 const
-  CModelPath   = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
   CBadMagicBin = 'bad_magic.gguf';
 
 { TGGUFReaderTest }

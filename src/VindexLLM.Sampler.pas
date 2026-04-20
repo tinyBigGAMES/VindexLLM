@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -256,13 +256,9 @@ begin
   FreeAndNil(FIndicesVBuf);
 
   FProbsVBuf := TVdxVirtualBuffer<Single>.Create();
-  FProbsVBuf.SetErrors(FErrors);
-  FProbsVBuf.Allocate(AVocabSize);
-
+  FProbsVBuf.Allocate(UInt64(AVocabSize) * SizeOf(Single));
   FIndicesVBuf := TVdxVirtualBuffer<Integer>.Create();
-  FIndicesVBuf.SetErrors(FErrors);
-  FIndicesVBuf.Allocate(AVocabSize);
-
+  FIndicesVBuf.Allocate(UInt64(AVocabSize) * SizeOf(Integer));
   FCachedVocabSize := AVocabSize;
 end;
 

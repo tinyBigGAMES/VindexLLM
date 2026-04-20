@@ -124,6 +124,10 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: gelu_mul.comp & exit /b 1 )
 %GLSLC% -V vec_add.comp -o vec_add.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: vec_add.comp & exit /b 1 )
 
+rem === Streaming PoC ===
+%GLSLC% -V checksum.comp -o checksum.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: checksum.comp & exit /b 1 )
+
 echo Shaders compiled.
 
 rem === Compile resource file ===

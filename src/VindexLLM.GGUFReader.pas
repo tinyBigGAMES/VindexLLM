@@ -22,20 +22,16 @@ uses
   VindexLLM.VirtualFile;
 
 const
-  // Error codes — user-facing messages live in VindexLLM.Resources.
-  VDX_ERROR_GG_READ_PAST_EOF       = 'GG01';
-  VDX_ERROR_GG_BAD_MAGIC           = 'GG02';
-  VDX_ERROR_GG_UNSUPPORTED_VERSION = 'GG03';
-  VDX_ERROR_GG_UNKNOWN_META_TYPE   = 'GG04';
-  VDX_ERROR_GG_NO_DATA_BASE        = 'GG05';
-  VDX_ERROR_GG_PARSE_EXCEPTION     = 'GG06';
+  VDX_ERROR_GG_PARSE       = 'GG01';
+  VDX_ERROR_GG_BAD_MAGIC   = 'GG02';
+  VDX_ERROR_GG_BAD_VERSION = 'GG03';
+  VDX_ERROR_GG_META_KEY    = 'GG04';
+  VDX_ERROR_GG_TENSOR      = 'GG05';
+  VDX_ERROR_GG_NOT_OPEN    = 'GG06';
 
 type
 
   { TVdxGGMLType }
-  // GGML tensor element types. Values from the GGUF spec — do not
-  // renumber. Gaps (e.g. 4, 5, 31..33) exist in the upstream spec
-  // and are preserved here.
   TVdxGGMLType = (
     gtF32     = 0,
     gtF16     = 1,
@@ -72,8 +68,6 @@ type
   );
 
   { TVdxGGUFMetaType }
-  // Metadata value type tags from the GGUF spec. Stored as UInt32
-  // in the file, mapped to this enum on parse.
   TVdxGGUFMetaType = (
     gmtUInt8   = 0,
     gmtInt8    = 1,
@@ -91,9 +85,6 @@ type
   );
 
   { TVdxGGUFMetaValue }
-  // Normalized metadata value. Only the fields relevant to ValueType
-  // carry meaningful data; the rest are zero. Arrays carry their
-  // element type separately so nested typing is preserved.
   TVdxGGUFMetaValue = record
     ValueType: TVdxGGUFMetaType;
     AsUInt64: UInt64;
@@ -106,9 +97,6 @@ type
   end;
 
   { TVdxGGUFTensorInfo }
-  // Per-tensor header parsed from the tensor-info block. DataOffset
-  // is relative to the tensor-data base (computed in ComputeTensorDataBase),
-  // not to file start.
   TVdxGGUFTensorInfo = record
     TensorName: string;
     NumDimensions: UInt32;
@@ -118,39 +106,30 @@ type
   end;
 
   { TVdxGGUFReader }
-  // Parses a GGUF file into indexed metadata + tensor info. The file
-  // is memory-mapped via a contained TVdxVirtualFile<Byte>; tensor
-  // data is accessed as zero-copy pointers into that mapping.
-  // Consumers call Open, inspect metadata / tensor info, call
-  // GetTensorDataPtr for raw tensor bytes, then Close (or Free).
-  // Pointers returned by GetTensorDataPtr are valid only between
-  // Open and Close of the same instance.
   TVdxGGUFReader = class(TVdxBaseObject)
   private
-    FFile: TVdxVirtualFile<Byte>;
-    FBasePtr: PByte;
-    FFileSize: UInt64;
+    // Memory-mapped file access
+    FVirtualFile: TVdxVirtualFile<Byte>;
 
+    // Parsed header
     FVersion: UInt32;
     FTensorCount: UInt64;
     FMetadataKVCount: UInt64;
     FAlignment: UInt32;
 
+    // Parsed data
     FMetadata: TDictionary<string, TVdxGGUFMetaValue>;
     FTensors: TDictionary<string, TVdxGGUFTensorInfo>;
     FTensorList: TList<TVdxGGUFTensorInfo>;
 
+    // Computed offset where tensor data begins
     FTensorDataBase: PByte;
+
+    // Cursor for sequential parsing
     FCursor: PByte;
-    FParseError: Boolean;
 
-    // Cursor bounds check. Sets FParseError and logs GG01 on EOF.
-    // Does not raise — read helpers check FParseError after calling.
+    // Internal read helpers
     procedure CheckCursor(const ASize: NativeUInt);
-
-    // Typed reads. Each advances FCursor by its element size on
-    // success; on FParseError already set, each returns a zero-valued
-    // result without advancing further.
     function ReadUInt8(): UInt8;
     function ReadInt8(): Int8;
     function ReadUInt16(): UInt16;
@@ -165,7 +144,7 @@ type
     function ReadGGUFString(): string;
     function ReadMetaValue(const AType: TVdxGGUFMetaType): TVdxGGUFMetaValue;
 
-    // Parse stages. Each early-exits if FParseError is already set.
+    // Internal parsing stages
     procedure ParseHeader();
     procedure ParseMetadata();
     procedure ParseTensorInfos();
@@ -175,64 +154,37 @@ type
     constructor Create(); override;
     destructor Destroy(); override;
 
-    // Opens a GGUF file, memory-maps it, and parses header +
-    // metadata + tensor-info sections. Any failure logs to FErrors
-    // and returns False — call HasFatal on GetErrors to distinguish.
-    // Errors from the underlying TVdxVirtualFile<Byte> propagate
-    // directly via the shared error buffer.
-    function  Open(const AFilePath: string): Boolean;
+    procedure SetErrors(const AErrors: TVdxErrors); override;
 
-    // Idempotent. Invalidates any pointers previously returned by
-    // GetTensorDataPtr.
+    // Open and parse a GGUF file (memory-maps entire file)
+    function Open(const AFilePath: string): Boolean;
+
+    // Close and unmap
     procedure Close();
 
-    // Header info.
+    // Header info
     function GetVersion(): UInt32;
     function GetTensorCount(): UInt64;
     function GetMetadataCount(): UInt64;
     function GetAlignment(): UInt32;
     function GetFileSize(): UInt64;
 
-    // True between a successful Open and the next Close (or Free).
-    // Cheap — tests whether the underlying memory-map is still live.
-    function IsOpen(): Boolean;
-
-    // Metadata access. HasMetadata is a cheap pre-check. GetMetadata
-    // returns True + populates AValue on hit, False + leaves AValue
-    // zero-initialized on miss — missing keys are not errors, callers
-    // decide significance. The typed convenience accessors return
-    // ADefault silently on miss for the same reason.
+    // Metadata access
     function HasMetadata(const AKey: string): Boolean;
-    function GetMetadata(const AKey: string;
-      out AValue: TVdxGGUFMetaValue): Boolean;
-    function GetMetadataString(const AKey: string;
-      const ADefault: string = ''): string;
-    function GetMetadataUInt64(const AKey: string;
-      const ADefault: UInt64 = 0): UInt64;
-    function GetMetadataUInt32(const AKey: string;
-      const ADefault: UInt32 = 0): UInt32;
-    function GetMetadataFloat32(const AKey: string;
-      const ADefault: Single = 0.0): Single;
+    function GetMetadata(const AKey: string; out AValue: TVdxGGUFMetaValue): Boolean;
+    function GetMetadataString(const AKey: string; const ADefault: string = ''): string;
+    function GetMetadataUInt64(const AKey: string; const ADefault: UInt64 = 0): UInt64;
+    function GetMetadataUInt32(const AKey: string; const ADefault: UInt32 = 0): UInt32;
+    function GetMetadataFloat32(const AKey: string; const ADefault: Single = 0.0): Single;
     function GetMetadataKeys(): TArray<string>;
 
-    // Tensor access. HasTensor is a cheap pre-check. GetTensorInfo
-    // follows the same out-param + Boolean convention as GetMetadata.
-    // GetTensorDataPtr returns nil + logs GG05 on miss or when the
-    // reader is not open; the returned PByte is a pointer into the
-    // memory-mapped file and is valid only while the reader stays
-    // open.
+    // Tensor access
     function HasTensor(const ATensorName: string): Boolean;
-    function GetTensorInfo(const ATensorName: string;
-      out AInfo: TVdxGGUFTensorInfo): Boolean;
-    function GetTensorDataPtr(const ATensorName: string): PByte;
-
-    // Tensors in the order they appear in the GGUF tensor-info
-    // block. Iteration preserves file order — useful for diagnostics
-    // and for consumers that don't have a predefined name list.
+    function GetTensorInfo(const ATensorName: string; out AInfo: TVdxGGUFTensorInfo): Boolean;
+    function GetTensorDataPtr(const ATensorName: string): Pointer;
     function GetTensorList(): TList<TVdxGGUFTensorInfo>;
   end;
 
-// Pure helpers — no error surface.
 function VdxGGMLTypeName(const AType: TVdxGGMLType): string;
 function VdxGGMLTypeSize(const AType: TVdxGGMLType): UInt64;
 function VdxGGMLTensorBytes(const AType: TVdxGGMLType;
@@ -240,15 +192,11 @@ function VdxGGMLTensorBytes(const AType: TVdxGGMLType;
 
 implementation
 
-uses
-  System.Classes,
-  VindexLLM.Resources;
-
 const
-  CGGUF_MAGIC          = $46554747;  // 'GGUF' as little-endian UInt32
+  CGGUF_MAGIC          = $46554747; // 'GGUF' as little-endian uint32
   CGGUF_DEFAULT_ALIGN  = 32;
 
-{ Pure helpers }
+{ Helper functions }
 
 function VdxGGMLTypeName(const AType: TVdxGGMLType): string;
 begin
@@ -290,8 +238,8 @@ begin
   end;
 end;
 
-// Returns bytes per element for non-quantized types; returns 0 for
-// quantized types (use VdxGGMLTensorBytes for those — block-based).
+// Returns bytes per element for non-quantized types.
+// For quantized types, returns 0 (use block-based calculation instead).
 function VdxGGMLTypeSize(const AType: TVdxGGMLType): UInt64;
 begin
   case Ord(AType) of
@@ -308,9 +256,11 @@ begin
   end;
 end;
 
-// Total byte size of a 2D tensor. Non-quantized: elements * element
-// size. Quantized: block count * block byte size per the GGML spec.
-// Returns 0 for unsupported quantization types.
+// Compute total byte size of a 2D tensor for any GGML type.
+// For non-quantized types: dim0 * dim1 * element_size.
+// For quantized types: block-based calculation.
+// Q4_0: 18 bytes per block of 32 elements.
+// Q8_0: 34 bytes per block of 32 elements.
 function VdxGGMLTensorBytes(const AType: TVdxGGMLType;
   const ADim0: UInt64; const ADim1: UInt64): UInt64;
 var
@@ -321,37 +271,37 @@ begin
   LTotalElements := ADim0 * ADim1;
 
   case Ord(AType) of
-    2: // Q4_0: block_size=32, block_bytes=18
+    2: // Q4_0: block_size=32, block_bytes=18 (2 scale + 16 qs)
     begin
       LNumBlocks := LTotalElements div 32;
       Result := LNumBlocks * 18;
     end;
 
-    3: // Q4_1: block_size=32, block_bytes=20
+    3: // Q4_1: block_size=32, block_bytes=20 (2 scale + 2 min + 16 qs)
     begin
       LNumBlocks := LTotalElements div 32;
       Result := LNumBlocks * 20;
     end;
 
-    8: // Q8_0: block_size=32, block_bytes=34
+    8: // Q8_0: block_size=32, block_bytes=34 (2 scale + 32 qs)
     begin
       LNumBlocks := LTotalElements div 32;
       Result := LNumBlocks * 34;
     end;
 
-    12: // Q4_K: block_size=256, block_bytes=144
+    12: // Q4_K: block_size=256, block_bytes=144 (2+2 scale/min + 12 sub-scales + 128 qs)
     begin
       LNumBlocks := LTotalElements div 256;
       Result := LNumBlocks * 144;
     end;
 
-    13: // Q5_K: block_size=256, block_bytes=176
+    13: // Q5_K: block_size=256, block_bytes=176 (2+2 + 12 + 32 high-bits + 128 qs)
     begin
       LNumBlocks := LTotalElements div 256;
       Result := LNumBlocks * 176;
     end;
 
-    14: // Q6_K: block_size=256, block_bytes=210
+    14: // Q6_K: block_size=256, block_bytes=210 (128 ql + 64 qh + 16 scales + 2 d)
     begin
       LNumBlocks := LTotalElements div 256;
       Result := LNumBlocks * 210;
@@ -373,54 +323,50 @@ constructor TVdxGGUFReader.Create();
 begin
   inherited Create();
 
-  // Own the file-map component, and share our error buffer with it
-  // so its errors land in our shared list (principle #10). FOwnsErrors
-  // on the child becomes False as a result of SetErrors.
-  FFile := TVdxVirtualFile<Byte>.Create();
-  FFile.SetErrors(FErrors);
+  FVirtualFile := TVdxVirtualFile<Byte>.Create();
+  FVirtualFile.SetErrors(FErrors);
 
-  FBasePtr         := nil;
-  FFileSize        := 0;
-  FVersion         := 0;
-  FTensorCount     := 0;
+  FVersion := 0;
+  FTensorCount := 0;
   FMetadataKVCount := 0;
-  FAlignment       := CGGUF_DEFAULT_ALIGN;
-  FTensorDataBase  := nil;
-  FCursor          := nil;
-  FParseError      := False;
+  FAlignment := CGGUF_DEFAULT_ALIGN;
+  FTensorDataBase := nil;
+  FCursor := nil;
 
-  FMetadata   := TDictionary<string, TVdxGGUFMetaValue>.Create();
-  FTensors    := TDictionary<string, TVdxGGUFTensorInfo>.Create();
+  FMetadata := TDictionary<string, TVdxGGUFMetaValue>.Create();
+  FTensors := TDictionary<string, TVdxGGUFTensorInfo>.Create();
   FTensorList := TList<TVdxGGUFTensorInfo>.Create();
 end;
 
 destructor TVdxGGUFReader.Destroy();
 begin
   Close();
+
   FreeAndNil(FTensorList);
   FreeAndNil(FTensors);
   FreeAndNil(FMetadata);
-  FreeAndNil(FFile);
+  FreeAndNil(FVirtualFile);
+
   inherited Destroy();
+end;
+
+procedure TVdxGGUFReader.SetErrors(const AErrors: TVdxErrors);
+begin
+  inherited SetErrors(AErrors);
+  if Assigned(FVirtualFile) then
+    FVirtualFile.SetErrors(AErrors);
 end;
 
 procedure TVdxGGUFReader.Close();
 begin
-  // File-map release delegated to the contained TVdxVirtualFile —
-  // it handles the Unmap / CloseHandle sequence safely and is
-  // itself idempotent.
-  if FFile <> nil then
-    FFile.Close();
+  FVirtualFile.Close();
 
-  FBasePtr         := nil;
-  FFileSize        := 0;
-  FVersion         := 0;
-  FTensorCount     := 0;
+  FVersion := 0;
+  FTensorCount := 0;
   FMetadataKVCount := 0;
-  FAlignment       := CGGUF_DEFAULT_ALIGN;
-  FTensorDataBase  := nil;
-  FCursor          := nil;
-  FParseError      := False;
+  FAlignment := CGGUF_DEFAULT_ALIGN;
+  FTensorDataBase := nil;
+  FCursor := nil;
 
   FMetadata.Clear();
   FTensors.Clear();
@@ -430,178 +376,145 @@ end;
 function TVdxGGUFReader.Open(const AFilePath: string): Boolean;
 begin
   Result := False;
-
-  // Idempotent re-open — release any prior state, including the
-  // shared-errors path. Caller inherits whatever errors accrue.
+  // Close any previously opened file
   Close();
 
   Status('Opening GGUF file: %s', [AFilePath]);
 
-  // Hand the path to the file-map component. On failure, its error
-  // (VF02/VF04/VF06) lands directly in our shared buffer — no need
-  // to log a separate GG-level error.
-  if not FFile.Open(AFilePath) then
+  // Memory-map the file via TVdxVirtualFile
+  if not FVirtualFile.Open(AFilePath) then
+  begin
+    Status('Failed to open file: %s', [AFilePath]);
     Exit;
+  end;
 
-  FBasePtr  := PByte(FFile.Memory);
-  FFileSize := FFile.Size;
-  FCursor   := FBasePtr;
+  Status('File size: %d bytes (%.2f GB)',
+    [FVirtualFile.Size, FVirtualFile.Size / (1024.0 * 1024.0 * 1024.0)]);
+  Status('File mapped into memory at $%p', [FVirtualFile.Memory]);
 
-  // Parse stages. Each checks FParseError at entry and bails; the
-  // try/except is a final safety net for any unexpected RTL raise
-  // (dict allocation, UTF-8 decode, etc.).
+  // Initialize cursor to start of file
+  FCursor := PByte(FVirtualFile.Memory);
+
   try
+    // Parse the file sequentially
     ParseHeader();
+    if FErrors.HasErrors() then
+    begin
+      Close();
+      Exit;
+    end;
+
     ParseMetadata();
+    if FErrors.HasErrors() then
+    begin
+      Close();
+      Exit;
+    end;
+
     ParseTensorInfos();
     ComputeTensorDataBase();
+
+    Status('GGUF parse complete: %d metadata entries, %d tensors',
+      [FMetadata.Count, FTensors.Count]);
+
+    Result := True;
   except
     on E: Exception do
     begin
-      FErrors.Add(esFatal, VDX_ERROR_GG_PARSE_EXCEPTION,
-        RSGGParseException, [E.Message]);
-      FParseError := True;
+      FErrors.Add(esFatal, VDX_ERROR_GG_PARSE, 'GGUF parse error: %s', [E.Message]);
+      Close();
     end;
   end;
-
-  if FParseError then
-  begin
-    Close();
-    Exit;
-  end;
-
-  Status('GGUF parse complete: %d metadata entries, %d tensors',
-    [FMetadata.Count, FTensors.Count]);
-
-  Result := True;
 end;
 
-{ Cursor bounds check — logs + sets flag instead of raising }
+{ Cursor bounds checking }
 
 procedure TVdxGGUFReader.CheckCursor(const ASize: NativeUInt);
 var
   LOffset: NativeUInt;
 begin
-  if FParseError then Exit;
-  LOffset := NativeUInt(FCursor) - NativeUInt(FBasePtr);
-  if LOffset + ASize > FFileSize then
-  begin
-    FErrors.Add(esFatal, VDX_ERROR_GG_READ_PAST_EOF,
-      RSGGReadPastEOF, [LOffset, ASize, FFileSize]);
-    FParseError := True;
-  end;
+  LOffset := NativeUInt(FCursor) - NativeUInt(FVirtualFile.Memory);
+  if LOffset + ASize > FVirtualFile.Size then
+    raise Exception.CreateFmt(
+      'GGUF read past end of file: offset=%d, need=%d, filesize=%d',
+      [LOffset, ASize, FVirtualFile.Size]);
 end;
 
-{ Typed read helpers — each advances FCursor on success; silently
-  returns zero-valued result if FParseError is already set or if
-  CheckCursor flips it. }
+{ Cursor read helpers — all advance FCursor }
 
 function TVdxGGUFReader.ReadUInt8(): UInt8;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(1);
-  if FParseError then Exit;
   Result := PByte(FCursor)^;
   Inc(FCursor, 1);
 end;
 
 function TVdxGGUFReader.ReadInt8(): Int8;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(1);
-  if FParseError then Exit;
   Result := PShortInt(FCursor)^;
   Inc(FCursor, 1);
 end;
 
 function TVdxGGUFReader.ReadUInt16(): UInt16;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(2);
-  if FParseError then Exit;
   Result := PWord(FCursor)^;
   Inc(FCursor, 2);
 end;
 
 function TVdxGGUFReader.ReadInt16(): Int16;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(2);
-  if FParseError then Exit;
   Result := PSmallInt(FCursor)^;
   Inc(FCursor, 2);
 end;
 
 function TVdxGGUFReader.ReadUInt32(): UInt32;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(4);
-  if FParseError then Exit;
   Result := PCardinal(FCursor)^;
   Inc(FCursor, 4);
 end;
 
 function TVdxGGUFReader.ReadInt32(): Int32;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(4);
-  if FParseError then Exit;
   Result := PInteger(FCursor)^;
   Inc(FCursor, 4);
 end;
 
 function TVdxGGUFReader.ReadUInt64(): UInt64;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(8);
-  if FParseError then Exit;
   Result := PUInt64(FCursor)^;
   Inc(FCursor, 8);
 end;
 
 function TVdxGGUFReader.ReadInt64(): Int64;
 begin
-  Result := 0;
-  if FParseError then Exit;
   CheckCursor(8);
-  if FParseError then Exit;
   Result := PInt64(FCursor)^;
   Inc(FCursor, 8);
 end;
 
 function TVdxGGUFReader.ReadFloat32(): Single;
 begin
-  Result := 0.0;
-  if FParseError then Exit;
   CheckCursor(4);
-  if FParseError then Exit;
   Result := PSingle(FCursor)^;
   Inc(FCursor, 4);
 end;
 
 function TVdxGGUFReader.ReadFloat64(): Double;
 begin
-  Result := 0.0;
-  if FParseError then Exit;
   CheckCursor(8);
-  if FParseError then Exit;
   Result := PDouble(FCursor)^;
   Inc(FCursor, 8);
 end;
 
 function TVdxGGUFReader.ReadBool(): Boolean;
 begin
-  Result := False;
-  if FParseError then Exit;
   CheckCursor(1);
-  if FParseError then Exit;
   Result := PByte(FCursor)^ <> 0;
   Inc(FCursor, 1);
 end;
@@ -611,18 +524,13 @@ var
   LLen: UInt64;
   LBytes: TBytes;
 begin
-  Result := '';
-  if FParseError then Exit;
-
   LLen := ReadUInt64();
-  if FParseError then Exit;
-  if LLen = 0 then Exit;
 
-  // Bounds-check the payload before allocating. A corrupted file
-  // could claim a huge length; CheckCursor flips FParseError here
-  // instead of attempting the allocation.
+  if LLen = 0 then
+    Exit('');
+
+  // Sanity check: string length should not exceed remaining file
   CheckCursor(NativeUInt(LLen));
-  if FParseError then Exit;
 
   SetLength(LBytes, LLen);
   Move(FCursor^, LBytes[0], LLen);
@@ -631,8 +539,7 @@ begin
   Result := TEncoding.UTF8.GetString(LBytes);
 end;
 
-function TVdxGGUFReader.ReadMetaValue(
-  const AType: TVdxGGUFMetaType): TVdxGGUFMetaValue;
+function TVdxGGUFReader.ReadMetaValue(const AType: TVdxGGUFMetaType): TVdxGGUFMetaValue;
 var
   LArrayLen: UInt64;
   LI: UInt64;
@@ -640,79 +547,85 @@ begin
   Result := Default(TVdxGGUFMetaValue);
   Result.ValueType := AType;
 
-  if FParseError then Exit;
-
   case AType of
-    gmtUInt8:   Result.AsUInt64  := ReadUInt8();
-    gmtInt8:    Result.AsInt64   := ReadInt8();
-    gmtUInt16:  Result.AsUInt64  := ReadUInt16();
-    gmtInt16:   Result.AsInt64   := ReadInt16();
-    gmtUInt32:  Result.AsUInt64  := ReadUInt32();
-    gmtInt32:   Result.AsInt64   := ReadInt32();
-    gmtFloat32: Result.AsFloat64 := ReadFloat32();
-    gmtBool:    Result.AsBool    := ReadBool();
-    gmtString:  Result.AsString  := ReadGGUFString();
-    gmtUInt64:  Result.AsUInt64  := ReadUInt64();
-    gmtInt64:   Result.AsInt64   := ReadInt64();
-    gmtFloat64: Result.AsFloat64 := ReadFloat64();
+    gmtUInt8:
+      Result.AsUInt64 := ReadUInt8();
+
+    gmtInt8:
+      Result.AsInt64 := ReadInt8();
+
+    gmtUInt16:
+      Result.AsUInt64 := ReadUInt16();
+
+    gmtInt16:
+      Result.AsInt64 := ReadInt16();
+
+    gmtUInt32:
+      Result.AsUInt64 := ReadUInt32();
+
+    gmtInt32:
+      Result.AsInt64 := ReadInt32();
+
+    gmtFloat32:
+      Result.AsFloat64 := ReadFloat32();
+
+    gmtBool:
+      Result.AsBool := ReadBool();
+
+    gmtString:
+      Result.AsString := ReadGGUFString();
+
+    gmtUInt64:
+      Result.AsUInt64 := ReadUInt64();
+
+    gmtInt64:
+      Result.AsInt64 := ReadInt64();
+
+    gmtFloat64:
+      Result.AsFloat64 := ReadFloat64();
 
     gmtArray:
     begin
+      // Read array element type and length
       Result.ArrayType := TVdxGGUFMetaType(ReadUInt32());
-      if FParseError then Exit;
-
       LArrayLen := ReadUInt64();
-      if FParseError then Exit;
-
       SetLength(Result.ArrayItems, LArrayLen);
-      if LArrayLen > 0 then
-      begin
-        for LI := 0 to LArrayLen - 1 do
-        begin
-          if FParseError then Exit;
-          Result.ArrayItems[LI] := ReadMetaValue(Result.ArrayType);
-        end;
-      end;
+
+      // Read each element
+      for LI := 0 to LArrayLen - 1 do
+        Result.ArrayItems[LI] := ReadMetaValue(Result.ArrayType);
     end;
   else
-    // Unknown type tag — file is corrupt or a newer GGUF version.
-    FErrors.Add(esFatal, VDX_ERROR_GG_UNKNOWN_META_TYPE,
-      RSGGUnknownMetaType, [Ord(AType)]);
-    FParseError := True;
+    raise Exception.CreateFmt('Unknown GGUF metadata type: %d', [Ord(AType)]);
   end;
 end;
 
-{ Parse stages }
+{ Parsing stages }
 
 procedure TVdxGGUFReader.ParseHeader();
 var
   LMagic: UInt32;
 begin
-  if FParseError then Exit;
-
+  // Read and validate magic number
   LMagic := ReadUInt32();
-  if FParseError then Exit;
-
   if LMagic <> CGGUF_MAGIC then
   begin
     FErrors.Add(esFatal, VDX_ERROR_GG_BAD_MAGIC,
-      RSGGBadMagic, [CGGUF_MAGIC, LMagic]);
-    FParseError := True;
+      'Invalid GGUF magic: expected $%08X, got $%08X', [CGGUF_MAGIC, LMagic]);
     Exit;
   end;
 
+  // Read version
   FVersion := ReadUInt32();
-  if FParseError then Exit;
-
   if FVersion < 2 then
   begin
-    FErrors.Add(esFatal, VDX_ERROR_GG_UNSUPPORTED_VERSION,
-      RSGGUnsupportedVersion, [FVersion]);
-    FParseError := True;
+    FErrors.Add(esFatal, VDX_ERROR_GG_BAD_VERSION,
+      'Unsupported GGUF version: %d (need >= 2)', [FVersion]);
     Exit;
   end;
 
-  FTensorCount     := ReadUInt64();
+  // Read counts
+  FTensorCount := ReadUInt64();
   FMetadataKVCount := ReadUInt64();
 
   Status('GGUF v%d — %d tensors, %d metadata entries',
@@ -726,31 +639,41 @@ var
   LValueType: TVdxGGUFMetaType;
   LValue: TVdxGGUFMetaValue;
 begin
-  if FParseError then Exit;
-  if FMetadataKVCount = 0 then Exit;
+  Status('Parsing %d metadata entries...', [FMetadataKVCount]);
 
   for LI := 0 to FMetadataKVCount - 1 do
   begin
-    if FParseError then Exit;
+    // Read key string
+    LKey := ReadGGUFString();
 
-    LKey       := ReadGGUFString();
+    // Read value type
     LValueType := TVdxGGUFMetaType(ReadUInt32());
-    LValue     := ReadMetaValue(LValueType);
-    if FParseError then Exit;
 
+    // Read value
+    LValue := ReadMetaValue(LValueType);
+
+    // Store in dictionary
     FMetadata.AddOrSetValue(LKey, LValue);
 
-    // Pick up the tensor-data alignment override if present. Default
-    // is 32 if the key is absent or zero.
+    // Check for alignment override
     if SameText(LKey, 'general.alignment') then
     begin
       FAlignment := UInt32(LValue.AsUInt64);
       if FAlignment = 0 then
         FAlignment := CGGUF_DEFAULT_ALIGN;
+      Status('  Alignment: %d', [FAlignment]);
     end;
+
+    // Log selected important metadata
+    if SameText(LKey, 'general.architecture') then
+      Status('  Architecture: %s', [LValue.AsString])
+    else if SameText(LKey, 'general.name') then
+      Status('  Model name: %s', [LValue.AsString])
+    else if SameText(LKey, 'general.file_type') then
+      Status('  File type: %d', [LValue.AsUInt64]);
   end;
 
-  Status('Metadata parsed: %d entries', [FMetadata.Count]);
+  Status('Metadata parsing complete (%d entries)', [FMetadata.Count]);
 end;
 
 procedure TVdxGGUFReader.ParseTensorInfos();
@@ -758,39 +681,47 @@ var
   LI: UInt64;
   LJ: UInt32;
   LInfo: TVdxGGUFTensorInfo;
+  LDimsStr: string;
 begin
-  if FParseError then Exit;
-  if FTensorCount = 0 then Exit;
+  Status('Parsing %d tensor info entries...', [FTensorCount]);
 
   for LI := 0 to FTensorCount - 1 do
   begin
-    if FParseError then Exit;
+    // Read tensor name
+    LInfo.TensorName := ReadGGUFString();
 
-    LInfo := Default(TVdxGGUFTensorInfo);
-
-    LInfo.TensorName    := ReadGGUFString();
+    // Read number of dimensions
     LInfo.NumDimensions := ReadUInt32();
-    if FParseError then Exit;
 
+    // Read each dimension
     SetLength(LInfo.Dimensions, LInfo.NumDimensions);
-    if LInfo.NumDimensions > 0 then
-    begin
-      for LJ := 0 to LInfo.NumDimensions - 1 do
-      begin
-        LInfo.Dimensions[LJ] := ReadUInt64();
-        if FParseError then Exit;
-      end;
-    end;
+    for LJ := 0 to LInfo.NumDimensions - 1 do
+      LInfo.Dimensions[LJ] := ReadUInt64();
 
+    // Read tensor type
     LInfo.TensorType := TVdxGGMLType(ReadUInt32());
-    LInfo.DataOffset := ReadUInt64();
-    if FParseError then Exit;
 
+    // Read data offset (relative to tensor_data start)
+    LInfo.DataOffset := ReadUInt64();
+
+    // Store in both dictionary and ordered list
     FTensors.AddOrSetValue(LInfo.TensorName, LInfo);
     FTensorList.Add(LInfo);
+
+    // Build dimensions string for status
+    LDimsStr := '';
+    for LJ := 0 to LInfo.NumDimensions - 1 do
+    begin
+      if LJ > 0 then
+        LDimsStr := LDimsStr + ' x ';
+      LDimsStr := LDimsStr + IntToStr(LInfo.Dimensions[LJ]);
+    end;
+
+    Status('  [%d] %s — %s [%s] offset=%d',
+      [LI, LInfo.TensorName, VdxGGMLTypeName(LInfo.TensorType), LDimsStr, LInfo.DataOffset]);
   end;
 
-  Status('Tensor infos parsed: %d tensors', [FTensors.Count]);
+  Status('Tensor info parsing complete (%d tensors)', [FTensors.Count]);
 end;
 
 procedure TVdxGGUFReader.ComputeTensorDataBase();
@@ -798,17 +729,16 @@ var
   LOffset: UInt64;
   LAligned: UInt64;
 begin
-  if FParseError then Exit;
+  // Current cursor position is right after all tensor info entries.
+  // Tensor data starts at the next ALIGNMENT boundary from here.
+  LOffset := UInt64(FCursor) - UInt64(FVirtualFile.Memory);
 
-  // Cursor is sitting right after the last tensor-info record.
-  // Tensor data starts at the next FAlignment boundary.
-  LOffset := UInt64(FCursor) - UInt64(FBasePtr);
-  LAligned := LOffset + (UInt64(FAlignment) -
-    (LOffset mod UInt64(FAlignment))) mod UInt64(FAlignment);
+  // Align: offset + (ALIGNMENT - (offset % ALIGNMENT)) % ALIGNMENT
+  LAligned := LOffset + (UInt64(FAlignment) - (LOffset mod UInt64(FAlignment))) mod UInt64(FAlignment);
 
-  FTensorDataBase := FBasePtr + LAligned;
+  FTensorDataBase := PByte(FVirtualFile.Memory) + LAligned;
 
-  Status('Tensor data base at file offset %d ($%x), alignment=%d',
+  Status('Tensor data starts at file offset %d ($%x), alignment=%d',
     [LAligned, LAligned, FAlignment]);
 end;
 
@@ -836,14 +766,7 @@ end;
 
 function TVdxGGUFReader.GetFileSize(): UInt64;
 begin
-  Result := FFileSize;
-end;
-
-function TVdxGGUFReader.IsOpen(): Boolean;
-begin
-  // FBasePtr is nil before Open and cleared by Close — non-nil
-  // exactly when the memory-map is live.
-  Result := FBasePtr <> nil;
+  Result := FVirtualFile.Size;
 end;
 
 { Public API — metadata access }
@@ -860,8 +783,7 @@ begin
   Result := FMetadata.TryGetValue(AKey, AValue);
 end;
 
-function TVdxGGUFReader.GetMetadataString(const AKey: string;
-  const ADefault: string): string;
+function TVdxGGUFReader.GetMetadataString(const AKey: string; const ADefault: string): string;
 var
   LValue: TVdxGGUFMetaValue;
 begin
@@ -871,8 +793,7 @@ begin
     Result := ADefault;
 end;
 
-function TVdxGGUFReader.GetMetadataUInt64(const AKey: string;
-  const ADefault: UInt64): UInt64;
+function TVdxGGUFReader.GetMetadataUInt64(const AKey: string; const ADefault: UInt64): UInt64;
 var
   LValue: TVdxGGUFMetaValue;
 begin
@@ -882,8 +803,7 @@ begin
     Result := ADefault;
 end;
 
-function TVdxGGUFReader.GetMetadataUInt32(const AKey: string;
-  const ADefault: UInt32): UInt32;
+function TVdxGGUFReader.GetMetadataUInt32(const AKey: string; const ADefault: UInt32): UInt32;
 var
   LValue: TVdxGGUFMetaValue;
 begin
@@ -893,8 +813,7 @@ begin
     Result := ADefault;
 end;
 
-function TVdxGGUFReader.GetMetadataFloat32(const AKey: string;
-  const ADefault: Single): Single;
+function TVdxGGUFReader.GetMetadataFloat32(const AKey: string; const ADefault: Single): Single;
 var
   LValue: TVdxGGUFMetaValue;
 begin
@@ -932,23 +851,27 @@ begin
   Result := FTensors.TryGetValue(ATensorName, AInfo);
 end;
 
-function TVdxGGUFReader.GetTensorDataPtr(
-  const ATensorName: string): PByte;
+function TVdxGGUFReader.GetTensorDataPtr(const ATensorName: string): Pointer;
 var
   LInfo: TVdxGGUFTensorInfo;
 begin
   Result := nil;
 
-  if (FTensorDataBase = nil) or (FBasePtr = nil) then
+  if not GetTensorInfo(ATensorName, LInfo) then
   begin
-    FErrors.Add(esError, VDX_ERROR_GG_NO_DATA_BASE, RSGGNoDataBase);
+    FErrors.Add(esError, VDX_ERROR_GG_TENSOR,
+      'GGUF tensor not found: %s', [ATensorName]);
     Exit;
   end;
 
-  // Missing tensor is not fatal at the reader layer — caller
-  // decides whether it matters.
-  if not FTensors.TryGetValue(ATensorName, LInfo) then Exit;
+  if FTensorDataBase = nil then
+  begin
+    FErrors.Add(esError, VDX_ERROR_GG_NOT_OPEN,
+      'GGUF file not open or tensor data base not computed');
+    Exit;
+  end;
 
+  // DataOffset is relative to the start of tensor_data
   Result := FTensorDataBase + LInfo.DataOffset;
 end;
 

@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -18,14 +18,8 @@ uses
   VindexLLM.Model;
 
 type
-  // ---------------------------------------------------------------------------
-  // TVdxModelRegistry
-  //
-  // Internal machinery that maps GGUF `general.architecture` strings to the
-  // concrete TVdxModel descendant that handles them. Concrete model units
-  // self-register in their `initialization` section — consumers never touch
-  // the registry directly, they go through TVdxModel.LoadModel.
-  // ---------------------------------------------------------------------------
+
+  { TVdxModelRegistry }
   TVdxModelRegistry = class
   private
     // Architecture name (lower-case) → concrete class reference.

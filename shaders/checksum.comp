@@ -1,0 +1,26 @@
+#version 450
+
+// Trivial checksum shader for streaming PoC.
+// Counts non-zero uint32 values among the first 256 in the input buffer.
+// Writes count as float to output. Any count > 0 proves data arrived on GPU.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuf {
+    uint data[];
+} inBuf;
+
+layout(std430, binding = 1) writeonly buffer OutputBuf {
+    float checksum;
+} outBuf;
+
+void main() {
+    uint count = min(256, uint(inBuf.data.length()));
+    uint nonZero = 0;
+    for (uint i = 0; i < count; i++) {
+        if (inBuf.data[i] != 0u) {
+            nonZero++;
+        }
+    }
+    outBuf.checksum = float(nonZero);
+}

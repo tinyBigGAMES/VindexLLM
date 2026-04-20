@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -41,14 +41,10 @@ uses
   System.SysUtils,
   VindexLLM.Utils,
   VindexLLM.Model,
-  VindexLLM.Model.Gemma3;
+  VindexLLM.Model.Gemma3,
+  UTest.Common;
 
 const
-  // Same path the GGUFReader test uses — full-precision reference
-  // model. Head-room on a 12 GB card because attn/FFN weights stream
-  // from mmap (not permanent VRAM). Only the embedding-table GPU
-  // mirror and norm buffers take real VRAM at load time.
-  CModelPath  = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
   CMaxContext = 1024;  // keep batch matrices small for the test
 
 { TModelGemma3Test }

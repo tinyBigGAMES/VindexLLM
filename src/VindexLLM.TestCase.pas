@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -23,9 +23,6 @@ uses
 type
 
   { TVdxTestCase }
-  // Abstract base for self-contained test cases. Subclasses set FTitle
-  // in their Create and override Run() to perform assertions via the
-  // Section / Check / FlushErrors helpers.
   TVdxTestCase = class(TVdxBaseObject)
   private
     FTitle: string;

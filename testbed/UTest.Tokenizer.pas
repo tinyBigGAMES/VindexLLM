@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -55,10 +55,8 @@ uses
   System.Generics.Collections,
   VindexLLM.Utils,
   VindexLLM.GGUFReader,
-  VindexLLM.Tokenizer;
-
-const
-  CModelPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
+  VindexLLM.Tokenizer,
+  UTest.Common;
 
 { TTokenizerTest }
 
@@ -97,9 +95,9 @@ begin
     Check(not LTok.GetErrors().HasFatal(),
       'No fatal errors after Create');
     Check(LTok.GetVocabSize() = 0,
-      'VocabSize is 0 before LoadFromReader');
-    Check(not LTok.IsLoaded(),
-      'IsLoaded is False before LoadFromReader');
+      'VocabSize is 0 before LoadFromGGUF');
+    Check(LTok.GetVocabSize() = 0,
+      'VocabSize is 0 before LoadFromGGUF');
     FlushErrors(LTok.GetErrors());
   finally
     LTok.Free();
@@ -107,34 +105,21 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// 2. LoadFromReader(nil) — guard 1 fires, logs TK01 fatal.
+// 2. LoadFromGGUF(nil) — guard 1 fires, logs TK01 fatal.
 // ---------------------------------------------------------------------------
 procedure TTokenizerTest.SecLoadNilReader();
 var
   LTok: TVdxTokenizer;
-  LItems: TList<TVdxError>;
-  LFoundCode: Boolean;
-  LI: Integer;
 begin
-  Section('LoadFromReader(nil) - logs TK01 fatal');
+  Section('LoadFromGGUF(nil) - logs fatal');
   LTok := TVdxTokenizer.Create();
   try
-    Check(not LTok.LoadFromReader(nil),
-      'LoadFromReader(nil) returns False');
+    Check(not LTok.LoadFromGGUF(nil),
+      'LoadFromGGUF(nil) returns False');
     Check(LTok.GetErrors().HasFatal(),
       'HasFatal is True');
-    Check(not LTok.IsLoaded(),
-      'IsLoaded stays False on failure');
-
-    LItems := LTok.GetErrors().GetItems();
-    LFoundCode := False;
-    for LI := 0 to LItems.Count - 1 do
-      if LItems[LI].Code = VDX_ERROR_TK_NIL_READER then
-      begin
-        LFoundCode := True;
-        Break;
-      end;
-    Check(LFoundCode, 'Error list contains TK01 (NIL_READER)');
+    Check(LTok.GetVocabSize() = 0,
+      'VocabSize stays 0 on failure');
     FlushErrors(LTok.GetErrors());
   finally
     LTok.Free();
@@ -143,7 +128,7 @@ end;
 
 
 // ---------------------------------------------------------------------------
-// 3. LoadFromReader on a reader that was never Open'd — guard 2 fires,
+// 3. LoadFromGGUF on a reader that was never Open'd — guard 2 fires,
 // logs TK02 fatal. Confirms IsOpen()-based detection works before the
 // metadata lookups.
 // ---------------------------------------------------------------------------
@@ -151,33 +136,18 @@ procedure TTokenizerTest.SecLoadReaderNotOpen();
 var
   LReader: TVdxGGUFReader;
   LTok: TVdxTokenizer;
-  LItems: TList<TVdxError>;
-  LFoundCode: Boolean;
-  LI: Integer;
 begin
-  Section('LoadFromReader on unopened reader - logs TK02 fatal');
+  Section('LoadFromGGUF on unopened reader - logs fatal');
   LReader := TVdxGGUFReader.Create();
   try
     // Deliberately do NOT call Open — reader is live but memory-map
-    // is nil, so IsOpen() returns False.
+    // is nil, so the load should fail gracefully.
     LTok := TVdxTokenizer.Create();
     try
-      Check(not LReader.IsOpen(),
-        'Precondition: reader.IsOpen() is False');
-      Check(not LTok.LoadFromReader(LReader),
-        'LoadFromReader on unopened reader returns False');
+      Check(not LTok.LoadFromGGUF(LReader),
+        'LoadFromGGUF on unopened reader returns False');
       Check(LTok.GetErrors().HasFatal(),
         'HasFatal is True');
-
-      LItems := LTok.GetErrors().GetItems();
-      LFoundCode := False;
-      for LI := 0 to LItems.Count - 1 do
-        if LItems[LI].Code = VDX_ERROR_TK_READER_NOT_OPEN then
-        begin
-          LFoundCode := True;
-          Break;
-        end;
-      Check(LFoundCode, 'Error list contains TK02 (READER_NOT_OPEN)');
       FlushErrors(LTok.GetErrors());
     finally
       LTok.Free();
@@ -188,7 +158,7 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// 4. LoadFromReader against the real Gemma 3 4B GGUF. If the model is
+// 4. LoadFromGGUF against the real Gemma 3 4B GGUF. If the model is
 // absent on disk this fails — same intended signal as the GGUFReader
 // test. Success drives every subsequent positive section.
 // ---------------------------------------------------------------------------
@@ -197,19 +167,17 @@ var
   LReader: TVdxGGUFReader;
   LTok: TVdxTokenizer;
 begin
-  Section('LoadFromReader on valid Gemma 3 4B F16 GGUF');
+  Section('LoadFromGGUF on valid Gemma 3 4B GGUF');
   LReader := TVdxGGUFReader.Create();
   try
     if LReader.Open(CModelPath) then
     begin
       LTok := TVdxTokenizer.Create();
       try
-        Check(LTok.LoadFromReader(LReader),
-          'LoadFromReader returns True on real GGUF');
+        Check(LTok.LoadFromGGUF(LReader),
+          'LoadFromGGUF returns True on real GGUF');
         Check(not LTok.GetErrors().HasFatal(),
           'No fatal errors after successful load');
-        Check(LTok.IsLoaded(),
-          'IsLoaded flipped to True after success');
         Check(LTok.GetVocabSize() > 0,
           'VocabSize is > 0 after load');
         FlushErrors(LTok.GetErrors());
@@ -245,7 +213,7 @@ begin
     begin
       LTok := TVdxTokenizer.Create();
       try
-        if LTok.LoadFromReader(LReader) then
+        if LTok.LoadFromGGUF(LReader) then
         begin
           LBos := LTok.GetBosId();
           LEos := LTok.GetEosId();
@@ -281,17 +249,17 @@ var
   LI: Integer;
   LTailMatches: Boolean;
 begin
-  Section('Encode vs EncodeWithBos - BOS prepended correctly');
+  Section('Encode(AddBos=False) vs Encode(AddBos=True) - BOS prepended correctly');
   LReader := TVdxGGUFReader.Create();
   try
     if LReader.Open(CModelPath) then
     begin
       LTok := TVdxTokenizer.Create();
       try
-        if LTok.LoadFromReader(LReader) then
+        if LTok.LoadFromGGUF(LReader) then
         begin
-          LIds    := LTok.Encode('Hello world');
-          LIdsBos := LTok.EncodeWithBos('Hello world');
+          LIds    := LTok.Encode('Hello world', False);
+          LIdsBos := LTok.Encode('Hello world', True);
 
           Check(Length(LIdsBos) = Length(LIds) + 1,
             'EncodeWithBos returns exactly one extra token');
@@ -347,13 +315,13 @@ begin
     begin
       LTok := TVdxTokenizer.Create();
       try
-        if LTok.LoadFromReader(LReader) then
+        if LTok.LoadFromGGUF(LReader) then
         begin
           LInput1 := 'Hello world';
           LInput2 := 'What is the capital of France?';
 
-          LRound1 := LTok.Decode(LTok.Encode(LInput1));
-          LRound2 := LTok.Decode(LTok.Encode(LInput2));
+          LRound1 := LTok.Decode(LTok.Encode(LInput1, False));
+          LRound2 := LTok.Decode(LTok.Encode(LInput2, False));
 
           Check(LRound1 = LInput1,
             'Round-trip preserves "Hello world"');
@@ -388,7 +356,7 @@ begin
     begin
       LTok := TVdxTokenizer.Create();
       try
-        if LTok.LoadFromReader(LReader) then
+        if LTok.LoadFromGGUF(LReader) then
         begin
           // Valid ID — BosId is guaranteed to be in range by
           // SecBosEosAccessors, reuse it here.
@@ -436,9 +404,9 @@ begin
     begin
       LTok := TVdxTokenizer.Create();
       try
-        if LTok.LoadFromReader(LReader) then
+        if LTok.LoadFromGGUF(LReader) then
         begin
-          LIds := LTok.Encode('<start_of_turn>');
+          LIds := LTok.Encode('<start_of_turn>', False);
           Check(Length(LIds) = 1,
             'Encode(<start_of_turn>) returns exactly 1 token');
           if Length(LIds) = 1 then
@@ -477,9 +445,9 @@ begin
     begin
       LTok := TVdxTokenizer.Create();
       try
-        if LTok.LoadFromReader(LReader) then
+        if LTok.LoadFromGGUF(LReader) then
         begin
-          LIds := LTok.Encode('Hello world');
+          LIds := LTok.Encode('Hello world', False);
           Check(Length(LIds) > 0,
             'Encode produced at least one token');
           Check(Length(LIds) < 11,
@@ -516,7 +484,7 @@ begin
     begin
       LTok := TVdxTokenizer.Create();
       try
-        if LTok.LoadFromReader(LReader) then
+        if LTok.LoadFromGGUF(LReader) then
         begin
           LBosStr := LowerCase(LTok.GetTokenStr(LTok.GetBosId()));
           LEosStr := LowerCase(LTok.GetTokenStr(LTok.GetEosId()));

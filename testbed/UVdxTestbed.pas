@@ -19,6 +19,7 @@ implementation
 
 uses
   WinAPI.Windows,
+  System.Generics.Collections,
   System.SysUtils,
   VindexLLM.Utils,
   VindexLLM.TestCase,
@@ -26,13 +27,15 @@ uses
   UTest.VirtualFile,
   UTest.Compute,
   UTest.GGUFReader,
-  UTest.Tokenizer,
-  UTest.LayerNorm,
-  UTest.Attention,
-  UTest.FFNWeights,
   UTest.TurboQuant,
+  UTest.LayerNorm,
+  UTest.FFNWeights,
+  UTest.Attention,
+  UTest.Model.Gemma3,
   UTest.Sampler,
-  UTest.Model.Gemma3;
+  UTest.Tokenizer,
+  UTest.Inference,
+  UTest.Demo;
 
 // ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
@@ -45,22 +48,25 @@ var
   LIndex: Integer;
 begin
   try
-    TVdxUtils.Pause('Press any key to start...');
+    TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 11;
+    LIndex := 13;
 
     case LIndex of
-      1: VdxRunTestCase(TVirtualBufferTest);
-      2: VdxRunTestCase(TVirtualFileTest);
-      3: VdxRunTestCase(TComputeTest);
-      4: VdxRunTestCase(TGGUFReaderTest);
-      5: VdxRunTestCase(TTokenizerTest);
-      6: VdxRunTestCase(TLayerNormTest);
-      7: VdxRunTestCase(TAttentionTest);
-      8: VdxRunTestCase(TFFNWeightsTest);
-      9: VdxRunTestCase(TTurboQuantTest);
+      01: VdxRunTestCase(TVirtualBufferTest);
+      02: VdxRunTestCase(TVirtualFileTest);
+      03: VdxRunTestCase(TComputeTest);
+      04: VdxRunTestCase(TGGUFReaderTest);
+      05: VdxRunTestCase(TTurboQuantTest);
+      06: VdxRunTestCase(TLayerNormTest);
+      07: VdxRunTestCase(TFFNWeightsTest);
+      08: VdxRunTestCase(TAttentionTest);
+      09: VdxRunTestCase(TModelGemma3Test);
       10: VdxRunTestCase(TSamplerTest);
-      11: VdxRunTestCase(TModelGemma3Test);
+      11: VdxRunTestCase(TTokenizerTest);
+      12: VdxRunTestCase(TInferenceTest);
+      13: Demo_Inference();
+      14: Demo_Chat();
     end;
   except
     on E: Exception do
