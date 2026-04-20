@@ -14,9 +14,12 @@
 
 Feed it a prompt, get tokens back. Everything between — embedding lookup, 34 layers of attention and FFN, normalization, sampling — happens on the GPU via GLSL 450 compute shaders compiled to SPIR-V and embedded as Windows resources into the binary.
 
+### Single-shot inference
+
 ```delphi
 var
   LInference: TVdxInference;
+  LConfig: TVdxSamplerConfig;
 begin
   LInference := TVdxInference.Create();
   try
@@ -27,11 +30,18 @@ begin
         Write(AToken);
       end, nil);
 
-    // Load model — initializes Vulkan, uploads weights to GPU
-    if LInference.LoadModel('path\to\gemma-3-4b.Q8_0.gguf') then
+    // Load model — memory-maps GGUF, initializes Vulkan, uploads weights to GPU
+    if LInference.LoadModel('path\to\gemma-3-4b-it-q4_0.gguf') then
     try
-      // Generate up to 256 tokens
-      LInference.Generate('Explain how a CPU works', 256);
+      // Configure sampler (Google-recommended settings for Gemma 3 4B IT)
+      LConfig := TVdxSampler.DefaultConfig();
+      LConfig.Temperature := 1.0;
+      LConfig.TopK := 64;
+      LConfig.TopP := 0.95;
+      LInference.SetSamplerConfig(LConfig);
+
+      // Generate up to 1024 tokens
+      LInference.Generate('Explain how a CPU works', 1024);
     finally
       LInference.UnloadModel();
     end;
@@ -41,14 +51,44 @@ begin
 end;
 ```
 
-Load a model, generate text, done. For sampling configuration, event callbacks, cancel support, and performance stats, see the full example in `testbed\UVdxTestbed.pas`.
+### Interactive chat with persistent memory
+
+```delphi
+var
+  LChat: TVdxConsoleChat;
+  LConfig: TVdxSamplerConfig;
+begin
+  LChat := TVdxConsoleChat.Create();
+  try
+    LChat.ModelPath := 'path\to\gemma-3-4b-it-q4_0.gguf';
+    LChat.EmbedderPath := 'path\to\embeddinggemma-300M-qat-Q4_0.gguf';
+    LChat.MemoryDbPath := 'session.db';
+    LChat.SystemPrompt := 'You are a helpful assistant.';
+    LChat.MaxTokens := 1024;
+
+    LConfig := TVdxSampler.DefaultConfig();
+    LConfig.Temperature := 1.0;
+    LConfig.TopK := 64;
+    LConfig.TopP := 0.95;
+    LChat.SamplerConfig := LConfig;
+
+    // Enter interactive chat loop — loads model, opens memory DB,
+    // retrieves context via RAG each turn, streams responses
+    LChat.Run();
+  finally
+    LChat.Free();
+  end;
+end;
+```
+
+Load a model, generate text, done. The chat example adds multi-turn conversation with SQLite-backed persistent memory and RAG retrieval across sessions. For the full implementations including status callbacks, cancel support, event hooks, error handling, and performance stats, see `testbed\UTest.Demo.pas`.
 
 ## Why VindexLLM?
 
 Most LLM inference stacks depend on CUDA (NVIDIA-only, ~3GB toolkit install), Python environments, or large runtime libraries. VindexLLM takes a different approach:
 - **Zero install** — Vulkan ships with every NVIDIA, AMD, and Intel GPU driver. No separate toolkit download, no PATH configuration, no DLL hell. The app calls `LoadLibrary('vulkan-1.dll')` and talks directly to the GPU.
 - **No vendor lock-in** — Vulkan runs on any modern GPU. Not tied to NVIDIA hardware.
-- **Self-contained binary** — All 35 compute shaders are compiled to SPIR-V at build time and embedded into the executable as Windows resources. No loose shader files, no runtime compilation.
+- **Self-contained binary** — All 37 compute shaders are compiled to SPIR-V at build time and embedded into the executable as Windows resources. No loose shader files, no runtime compilation.
 - **No Python, no runtime** — Pure compiled Delphi. Starts instantly, no interpreter warmup, no dependency resolution.
 - **Memory-mapped model loading** — GGUF files are mapped directly via `CreateFileMapping` / `MapViewOfFile`. Weights are accessed at their file offsets and uploaded to VRAM through staging buffers. No intermediate copies, no parsing into custom formats.
 - **Everything on GPU** — The residual stream never leaves VRAM between layers. The only PCIe transfers are the initial token embedding (~10KB) and the final logits download for sampling. Everything else — attention, FFN, norms, activations, residual additions — runs as GPU compute dispatches.
@@ -85,11 +125,11 @@ VindexLLM implements the standard dense transformer forward pass. For each token
                      │  ──► Sample (temp, top-K/P, min-P, repeat)   │
                      └──────────────────────────────────────────────┘
 ```
-Prefill processes all prompt tokens in parallel using batched matmul shaders. Autoregressive generation runs one token at a time using matvec shaders. Both paths share the same KV cache, which uses TQ3 compression to reduce VRAM usage by 10.7× compared to F32.
+Prefill processes all prompt tokens in parallel using batched matmul shaders. Autoregressive generation runs one token at a time using matvec shaders. Both paths share the same KV cache, which uses TQ3 compression to reduce VRAM usage by ~9× compared to F32.
 
 ## Current Status
 
-Dense inference is working end-to-end. The engine loads a Gemma 3 4B GGUF, tokenizes a prompt with chat template formatting, runs the full forward pass on the GPU, and generates coherent text with configurable sampling.
+Dense inference is working end-to-end. The engine loads a Gemma 3 4B GGUF, tokenizes a prompt with chat template formatting, runs the full forward pass on the GPU, and generates coherent text with configurable sampling. A complete interactive chat system with persistent memory and RAG is built on top of the inference engine.
 
 **What works today:**
 
@@ -101,20 +141,26 @@ Dense inference is working end-to-end. The engine loads a Gemma 3 4B GGUF, token
 - Pure Delphi BPE tokenizer loaded directly from GGUF vocabulary (no external SentencePiece library)
 - Token sampling: temperature, top-K, top-P, min-P, repetition penalty, deterministic seeding (xoshiro256** PRNG)
 - Gemma 3 chat template formatting
-- Architecture validation (graceful error for unsupported models)
-- Configurable context length with model-max clamping
+- Interactive multi-turn console chat (`TVdxConsoleChat`) with streaming output, ESC cancel, slash commands
+- SQLite-backed persistent conversation memory (`TVdxMemory`) with SHA-256 dedup and semantic dedup (cosine similarity threshold)
+- RAG retrieval: cosine-similarity vector search over stored turns using EmbeddingGemma 300M, merged and injected as reference context each turn
+- Embedding model support (`TVdxEmbeddings`) — loads a second GGUF for vector search independently of the inference model
+- Session management (`TVdxSession`) wrapping inference + memory + embeddings into a single lifecycle
+- Model abstraction layer with architecture registry — graceful error for unsupported models
+- Architecture validation and configurable context length with model-max clamping
 - VRAM usage reporting (weights, cache, buffers breakdown)
 - Context overflow detection (`srContextFull` stop reason)
 - Inference event callbacks (load/unload/prefill/generate start/end)
 - Cancel callback (poll per-layer, ESC to abort in testbed)
+- Memory-mapped file access (`TVdxVirtualFile`) for zero-copy GGUF weight reads
 - Page-file-backed virtual buffers (`TVdxVirtualBuffer<T>`) for CPU workspace — allocates address space without committing physical RAM until touched
-- 35 GLSL 450 compute shaders compiled to SPIR-V and embedded as Windows resources
+- 37 GLSL 450 compute shaders compiled to SPIR-V and embedded as Windows resources
 
 ## TurboQuant (TQ3)
 
 TurboQuant is VindexLLM's custom 3-bit quantization format, designed specifically for KV cache compression. It uses a Walsh-Hadamard Transform (WHT) to decorrelate values within each 32-element block before quantizing to 3 bits using Lloyd-Max optimal centroids fitted to a standard normal distribution.
 
-The result is 10.7× compression versus F32 (32 floats × 4 bytes = 128 bytes → 16 bytes per block) with quality that significantly outperforms naive 3-bit rounding because the WHT spreads information across all elements before quantization.
+The result is ~9× compression versus F32 with quality that significantly outperforms naive 3-bit rounding because the WHT spreads information across all elements before quantization.
 
 **TQ3 pipeline (per block of 32 values):**
 
@@ -131,14 +177,16 @@ CPU reference implementations exist in `VindexLLM.TurboQuant.pas` for validation
 
 ## Supported Models
 
-VindexLLM currently implements the Gemma 3 4B architecture. Two GGUF files have been vetted and confirmed to produce correct output. All vetted models are available for download from the [tinyBigGAMES Hugging Face account](https://huggingface.co/tinybiggames).
+VindexLLM currently implements the Gemma 3 4B architecture. The following GGUF files have been vetted and confirmed to produce correct output. All vetted models are collected in the [tinyBigGAMES Hugging Face collection](https://huggingface.co/collections/tinybiggames/gemma-3).
 
-| Model | Format | Size | Download |
-|-------|--------|------|----------|
-| gemma-3-4b-it-null-space-abliterated | Q8_0 | ~4.1 GB | [Download](https://huggingface.co/tinybiggames/gemma-3-4b-it-null-space-abliterated-GGUF/resolve/main/gemma-3-4b-it-null-space-abliterated.Q8_0.gguf) |
-| gemma-3-4b-it-null-space-abliterated | F16 | ~8.0 GB | [Download](https://huggingface.co/tinybiggames/gemma-3-4b-it-null-space-abliterated-GGUF/resolve/main/gemma-3-4b-it-null-space-abliterated.f16.gguf) |
+| Model | Purpose | Format | Size | Download |
+|-------|---------|--------|------|----------|
+| gemma-3-4b-it-qat-q4_0 | Inference (chat/generation) | Q4_0 | ~2.5 GB | [Download](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf/resolve/main/gemma-3-4b-it-q4_0.gguf) |
+| embeddinggemma-300M-qat-Q4_0 | Embeddings (memory/RAG) | Q4_0 | ~278 MB | [Download](https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf) |
 
-Other Gemma 3 4B GGUF files may work but have not been tested. Non-Gemma architectures are not supported — the engine will report a clear error message if you attempt to load an unsupported model.
+Both vetted models use **QAT (Quantization-Aware Training)** Q4_0 rather than post-training quantized Q4_0. With QAT, the quantization error is accounted for during training — the model learns to compensate for reduced precision, producing significantly better output quality at the same 4-bit size. This gives the smallest practical VRAM footprint while preserving quality, making it possible to run the full stack (inference + embeddings + memory/RAG) comfortably on most consumer GPUs with 4–6 GB of VRAM.
+
+Other Gemma 3 4B GGUF files may work but have not been tested. Non-Gemma architectures are not supported at this time — the engine will report a clear error message if you attempt to load an unsupported model.
 
 ## Performance
 
@@ -154,7 +202,7 @@ All computation runs on the GPU. The only PCIe transfers per token are the embed
 
 ## Getting Started
 
-1. Download a vetted GGUF model from the links above
+1. Download the vetted GGUF models from the links above (inference model required, embedding model optional for memory/RAG)
 2. Clone the repository:
 
 ```bash
@@ -163,10 +211,10 @@ git clone https://github.com/tinyBigGAMES/VindexLLM.git
 
 3. Open `src\VindexLLM - Liberating LLM inference.groupproj` in Delphi 12 or higher
 4. Build the `VdxTestbed` project
-5. Edit the model path in `testbed\UVdxTestbed.pas` (the `LoadModel()` call) to point to your downloaded GGUF
+5. Edit the model paths in `testbed\UTest.Common.pas` (`CModelPath` and `CEmbedderPath`) to point to your downloaded GGUFs
 6. Run the testbed — it will load the model, print status messages during weight upload, then generate text with streaming output
 
-The testbed demonstrates the full API: model loading, sampler configuration, token streaming callback, inference event callbacks, cancel callback (press ESC to abort), and stats reporting (prefill/generation throughput, VRAM usage).
+The testbed includes two demos in `testbed\UTest.Demo.pas`: single-shot inference (`Demo_Inference`) showing the full low-level API with callbacks, sampler config, and stats reporting; and interactive chat (`Demo_Chat`) showing multi-turn conversation with persistent memory and RAG.
 
 ## System Requirements
 
@@ -174,7 +222,7 @@ The testbed demonstrates the full API: model loading, sampler configuration, tok
 |---|---|
 | **Host OS** | Windows 10/11 x64 |
 | **GPU** | Any Vulkan 1.0+ capable GPU (NVIDIA, AMD, Intel) |
-| **VRAM** | 6 GB minimum (Q8_0), 12 GB recommended (F16) |
+| **VRAM** | 4 GB minimum (Q4_0), 6 GB (Q8_0), 12 GB (F16) |
 | **RAM** | 16 GB minimum (GGUF is memory-mapped) |
 | **Building from source** | Delphi 12.x or higher |
 
@@ -211,24 +259,33 @@ The shader SPIR-V binaries and compiled resource file (`VindexLLM.Shaders.res`) 
 |------|---------|
 | `VindexLLM.Inference.pas` | Orchestrator — model loading, forward pass, generation loop, stats |
 | `VindexLLM.Attention.pas` | GQA attention, QKV projections, QK-norm, RoPE, KV cache, TQ3 cache, batched prefill attention |
+| `VindexLLM.FFN.pas` | FFN weight management — layer views, GPU upload via staging |
 | `VindexLLM.Compute.pas` | Vulkan device manager — instance, buffers, shader dispatch, batch mode |
 | `VindexLLM.Vulkan.pas` | Vulkan API type definitions and function pointer bindings |
 | `VindexLLM.LayerNorm.pas` | RMSNorm (single + batch, plain + fused copy variants) |
-| `VindexLLM.FFNWeights.pas` | FFN weight management — mmap'd layer views, GPU upload via staging |
 | `VindexLLM.TurboQuant.pas` | TQ3 quantization — GPU pipelines + CPU reference implementations |
 | `VindexLLM.Tokenizer.pas` | Pure Delphi BPE tokenizer loaded from GGUF vocabulary |
-| `VindexLLM.ChatTemplate.pas` | Chat template detection and prompt formatting |
 | `VindexLLM.Sampler.pas` | Token sampling — temperature, top-K/P, min-P, repetition penalty, xoshiro256** |
+| `VindexLLM.Chat.pas` | Chat lifecycle, template-method base class, slash commands, callback bridging |
+| `VindexLLM.ConsoleChat.pas` | Console chat UI — ANSI colors, ESC cancel, word-wrapped streaming output |
+| `VindexLLM.Session.pas` | Session management — wraps inference + memory + embeddings into a single lifecycle |
+| `VindexLLM.Memory.pas` | SQLite-backed persistent memory — SHA-256 dedup, semantic dedup, pinning, RAG retrieval |
+| `VindexLLM.Embeddings.pas` | Embedding model support — loads a second GGUF for vector search |
+| `VindexLLM.Model.pas` | Base model abstraction (layer structure, architecture metadata) |
+| `VindexLLM.Model.Gemma3.pas` | Gemma 3 architecture implementation |
+| `VindexLLM.Model.Registry.pas` | Architecture dispatch registry |
 | `VindexLLM.GGUFReader.pas` | GGUF parser — metadata, tensor info, memory-mapped file access |
+| `VindexLLM.VirtualFile.pas` | Memory-mapped file access (`TVdxVirtualFile`) |
 | `VindexLLM.Shaders.pas` | Shader resource loader (SPIR-V binaries from embedded Windows resources) |
 | `VindexLLM.VirtualBuffer.pas` | Page-file-backed generic buffer (`TVdxVirtualBuffer<T>`) |
 | `VindexLLM.TokenWriter.pas` | Word-wrapping writer for streaming token output (with console subclass) |
 | `VindexLLM.Config.pas` | Configuration management |
-| `VindexLLM.Utils.pas` | Base classes (`TVdxBaseObject`, `TVdxStatusObject`, `TVdxErrorsObject`), utilities |
+| `VindexLLM.Utils.pas` | Base class (`TVdxBaseObject`), error buffer, utilities |
 | `VindexLLM.TOML.pas` | TOML parser |
 | `VindexLLM.Resources.pas` | Resource management |
+| `VindexLLM.TestCase.pas` | Test framework base class (`TVdxTestCase`) |
 
-### Compute Shaders (35 shaders)
+### Compute Shaders (37 shaders)
 
 | Category | Shaders |
 |----------|---------|
@@ -237,11 +294,12 @@ The shader SPIR-V binaries and compiled resource file (`VindexLLM.Shaders.res`) 
 | **RMSNorm** | `rmsnorm`, `rmsnorm_copy`, `rmsnorm_batch`, `rmsnorm_copy_batch` |
 | **QK-norm + RoPE** | `qk_norm`, `rope`, `rope_batch` |
 | **Attention** (single token) | `attn_scores_mh`, `softmax_mh`, `attn_value_mh` |
-| **Attention** (batched prefill) | `attn_scores_prefill`, `softmax_prefill`, `attn_value_prefill` |
+| **Attention** (batched prefill) | `attn_scores_prefill`, `attn_scores_prefill_bidir`, `softmax_prefill`, `attn_value_prefill` |
 | **KV cache** | `kv_cache_store`, `kv_cache_store_batch` |
 | **Embedding lookup** | `embed_lookup_f16`, `embed_lookup_q8`, `embed_lookup_q4_0`, `embed_lookup_batch_f16`, `embed_lookup_batch_q8`, `embed_lookup_batch_q4_0` |
 | **TurboQuant TQ3** | `tq3_quantize`, `tq3_dequantize`, `tq3_kv_quantize`, `tq3_kv_dequantize`, `kv_cache_store_batch_tq3`, `attn_scores_mh_tq3` |
 | **Activation + residual** | `gelu_mul`, `vec_add` |
+| **Diagnostics** | `checksum` |
 
 All shaders are written in GLSL 450 with no Vulkan extensions required. They are compiled to SPIR-V via `glslangValidator` and embedded into the binary as Windows resources at build time.
 
