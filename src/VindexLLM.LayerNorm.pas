@@ -64,6 +64,18 @@ type
     FDescPoolCopy: VkDescriptorPool;
     FDescSetCopy: VkDescriptorSet;
 
+    // Fused norm+add pipeline (reads input, norms, adds to accumulator)
+    FShaderModuleAdd: VkShaderModule;
+    FBundleAdd: TVdxComputePipelineBundle;
+    FDescPoolAdd: VkDescriptorPool;
+    FDescSetAdd: VkDescriptorSet;
+
+    // Batched fused norm+add pipeline
+    FShaderModuleAddBatch: VkShaderModule;
+    FBundleAddBatch: TVdxComputePipelineBundle;
+    FDescPoolAddBatch: VkDescriptorPool;
+    FDescSetAddBatch: VkDescriptorSet;
+
     // Batched norm pipelines (Phase 6D — prefill batching)
     // In-place batch: dispatch (num_tokens,1,1), reuses FDescLayout (2 bindings)
     FShaderModuleBatch: VkShaderModule;
@@ -109,6 +121,16 @@ type
       const AWeightBuf: TVdxGpuBuffer; const ADestBuf: TVdxGpuBuffer;
       const AHiddenDim: UInt32; const ANumTokens: UInt32);
 
+    // Fused norm+add: read input, normalize, add to accumulator (input untouched)
+    procedure ApplyAdd(const AInputBuf: TVdxGpuBuffer;
+      const AWeightBuf: TVdxGpuBuffer; const AAccumBuf: TVdxGpuBuffer;
+      const AHiddenDim: UInt32);
+
+    // Batched fused norm+add on matrices [NumTokens x HiddenDim]
+    procedure ApplyAddBatch(const AInputBuf: TVdxGpuBuffer;
+      const AWeightBuf: TVdxGpuBuffer; const AAccumBuf: TVdxGpuBuffer;
+      const AHiddenDim: UInt32; const ANumTokens: UInt32);
+
     // Upload attn_norm + ffn_norm weights from GGUF to GPU for one layer
     procedure UploadNormWeights(const AReader: TVdxGGUFReader;
       const ALayerIndex: Integer; out AWeights: TVdxNormLayerWeights);
@@ -141,6 +163,16 @@ begin
   FDescLayoutCopy := VK_NULL_HANDLE;
   FDescPoolCopy := VK_NULL_HANDLE;
   FDescSetCopy := VK_NULL_HANDLE;
+  FShaderModuleAdd := VK_NULL_HANDLE;
+  FBundleAdd.Pipeline := VK_NULL_HANDLE;
+  FBundleAdd.PipelineLayout := VK_NULL_HANDLE;
+  FDescPoolAdd := VK_NULL_HANDLE;
+  FDescSetAdd := VK_NULL_HANDLE;
+  FShaderModuleAddBatch := VK_NULL_HANDLE;
+  FBundleAddBatch.Pipeline := VK_NULL_HANDLE;
+  FBundleAddBatch.PipelineLayout := VK_NULL_HANDLE;
+  FDescPoolAddBatch := VK_NULL_HANDLE;
+  FDescSetAddBatch := VK_NULL_HANDLE;
   FShaderModuleBatch := VK_NULL_HANDLE;
   FBundleBatch.Pipeline := VK_NULL_HANDLE;
   FBundleBatch.PipelineLayout := VK_NULL_HANDLE;
@@ -234,6 +266,31 @@ begin
   FDescSetCopyBatch := FCompute.AllocateDescriptorSetForBuffers(
     FDescPoolCopyBatch, FDescLayoutCopy, [LDummyBuf, LDummyBuf, LDummyBuf]);
 
+  // --- Fused norm+add (single token) ---
+  LSpvData := VdxLoadShader('RMSNORM_ADD');
+  FShaderModuleAdd := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  // Reuse FDescLayoutCopy (3 bindings: input, weight, accumulator)
+  FBundleAdd := FCompute.CreateComputePipelineWithPush(
+    FShaderModuleAdd, 'main', FDescLayoutCopy, SizeOf(TVdxRMSNormPush));
+  FDescPoolAdd := FCompute.CreateDescriptorPoolForStorage(1, 3);
+  FDescSetAdd := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPoolAdd, FDescLayoutCopy, [LDummyBuf, LDummyBuf, LDummyBuf]);
+
+  // --- Batched fused norm+add ---
+  LSpvData := VdxLoadShader('RMSNORM_ADD_BATCH');
+  FShaderModuleAddBatch := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  // Reuse FDescLayoutCopy (3 bindings: input, weight, accumulator)
+  FBundleAddBatch := FCompute.CreateComputePipelineWithPush(
+    FShaderModuleAddBatch, 'main', FDescLayoutCopy,
+    SizeOf(TVdxRMSNormBatchPush));
+  FDescPoolAddBatch := FCompute.CreateDescriptorPoolForStorage(1, 3);
+  FDescSetAddBatch := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPoolAddBatch, FDescLayoutCopy, [LDummyBuf, LDummyBuf, LDummyBuf]);
+
   Status('LayerNorm: Ready');
 end;
 
@@ -265,6 +322,25 @@ begin
   end;
   FCompute.DestroyShaderModuleHandle(FShaderModuleCopyBatch);
   FShaderModuleCopyBatch := VK_NULL_HANDLE;
+
+  // Destroy fused norm+add resources
+  FCompute.DestroyComputePipelineBundle(FBundleAdd);
+  if FDescPoolAdd <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FDescPoolAdd);
+    FDescPoolAdd := VK_NULL_HANDLE;
+  end;
+  FCompute.DestroyShaderModuleHandle(FShaderModuleAdd);
+  FShaderModuleAdd := VK_NULL_HANDLE;
+
+  FCompute.DestroyComputePipelineBundle(FBundleAddBatch);
+  if FDescPoolAddBatch <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FDescPoolAddBatch);
+    FDescPoolAddBatch := VK_NULL_HANDLE;
+  end;
+  FCompute.DestroyShaderModuleHandle(FShaderModuleAddBatch);
+  FShaderModuleAddBatch := VK_NULL_HANDLE;
 
   if FDescPoolCopy <> VK_NULL_HANDLE then
   begin
@@ -380,6 +456,53 @@ begin
     FBundleCopyBatch.Pipeline,
     FBundleCopyBatch.PipelineLayout,
     FDescSetCopyBatch,
+    @LPush,
+    SizeOf(LPush),
+    ANumTokens  // one workgroup per token row
+  );
+end;
+
+procedure TVdxLayerNorm.ApplyAdd(const AInputBuf: TVdxGpuBuffer;
+  const AWeightBuf: TVdxGpuBuffer; const AAccumBuf: TVdxGpuBuffer;
+  const AHiddenDim: UInt32);
+var
+  LPush: TVdxRMSNormPush;
+begin
+  // Rebind buffers: input (readonly), weight (readonly), accumulator (readwrite)
+  FCompute.UpdateDescriptorSetBuffers(FDescSetAdd,
+    [AInputBuf, AWeightBuf, AAccumBuf]);
+
+  LPush.HiddenDim := AHiddenDim;
+  LPush.Eps := FEpsilon;
+
+  // Single workgroup — reads input, norms, adds to accumulator
+  FCompute.DispatchComputeWithPush(
+    FBundleAdd.Pipeline,
+    FBundleAdd.PipelineLayout,
+    FDescSetAdd,
+    @LPush,
+    SizeOf(LPush),
+    1  // 1 workgroup
+  );
+end;
+
+procedure TVdxLayerNorm.ApplyAddBatch(const AInputBuf: TVdxGpuBuffer;
+  const AWeightBuf: TVdxGpuBuffer; const AAccumBuf: TVdxGpuBuffer;
+  const AHiddenDim: UInt32; const ANumTokens: UInt32);
+var
+  LPush: TVdxRMSNormBatchPush;
+begin
+  FCompute.UpdateDescriptorSetBuffers(FDescSetAddBatch,
+    [AInputBuf, AWeightBuf, AAccumBuf]);
+
+  LPush.HiddenDim := AHiddenDim;
+  LPush.Eps := FEpsilon;
+  LPush.NumTokens := ANumTokens;
+
+  FCompute.DispatchComputeWithPush(
+    FBundleAddBatch.Pipeline,
+    FBundleAddBatch.PipelineLayout,
+    FDescSetAddBatch,
     @LPush,
     SizeOf(LPush),
     ANumTokens  // one workgroup per token row

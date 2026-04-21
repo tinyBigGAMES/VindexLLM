@@ -1,0 +1,82 @@
+#version 450
+
+// Batched Fused RMSNorm+Add: reads input matrix, normalizes each row,
+// adds to accumulator matrix. Dispatch (num_tokens, 1, 1).
+//
+// Formula: accum[tok][i] += (input[tok][i] / rms_tok) * weight[i]
+//          rms_tok = sqrt(sum(input[tok][j]^2) / dim + eps)
+//
+// Bindings:
+//   0 = input matrix  (float[], num_tokens x HiddenDim, row-major, read-only)
+//   1 = weight vector (float[], HiddenDim elements, read-only, shared across rows)
+//   2 = accumulator   (float[], num_tokens x HiddenDim, row-major, read-write)
+//
+// Push constants:
+//   hidden_dim  = number of elements per row
+//   eps         = epsilon for numerical stability (1e-6)
+//   num_tokens  = number of rows (for bounds checking)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  hidden_dim;
+    float eps;
+    uint  num_tokens;
+} pc;
+
+layout(std430, binding = 0) readonly buffer InputBuf {
+    float input_mat[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightBuf {
+    float weight[];
+};
+
+layout(std430, binding = 2) buffer AccumBuf {
+    float accum[];
+};
+
+// Shared memory for parallel reduction
+shared float partial_sums[256];
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.hidden_dim;
+
+    if (tok >= pc.num_tokens)
+        return;
+
+    uint row_off = tok * dim;
+
+    // Phase 1: Each thread accumulates sum-of-squares for its elements
+    float sum_sq = 0.0;
+    for (uint i = tid; i < dim; i += 256) {
+        float val = input_mat[row_off + i];
+        sum_sq += val * val;
+    }
+    partial_sums[tid] = sum_sq;
+
+    barrier();
+
+    // Parallel reduction in shared memory
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial_sums[tid] += partial_sums[tid + stride];
+        }
+        barrier();
+    }
+
+    // Thread 0 computes the final RMS value and stores in shared[0]
+    if (tid == 0) {
+        partial_sums[0] = 1.0 / sqrt(partial_sums[0] / float(dim) + pc.eps);
+    }
+
+    barrier();
+
+    // Phase 2: Each thread normalizes and adds to accumulator
+    float inv_rms = partial_sums[0];
+    for (uint i = tid; i < dim; i += 256) {
+        accum[row_off + i] += input_mat[row_off + i] * inv_rms * weight[i];
+    }
+}
