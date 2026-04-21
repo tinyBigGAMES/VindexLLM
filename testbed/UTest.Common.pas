@@ -26,7 +26,9 @@ const
   // Path to the embedding model — EmbeddingGemma 300M, Q8_0 quantized.
   // Used by TVdxMemory to embed turns for cosine-similarity vector search.
   // Set to '' to disable vector search and use FTS5 keyword search only.
-  CEmbedderPath = 'C:\Dev\LLM\GGUF\embeddinggemma-300M-qat-Q4_0.gguf';
+  CEmbedderPath = 'C:\Dev\LLM\GGUF\embeddinggemma-300m-qat-Q8_0.gguf';
+
+  CFuncModelPath = 'C:\Dev\LLM\GGUF\functiongemma-270m-it-q8_0.gguf';
 
 
   CHiddenDim: UInt32 = 2560;

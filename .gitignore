@@ -100,3 +100,4 @@ bin/build.cmd
 /src_ref2
 /src_ref3
 /testbed - Copy
+bin/funccall_session.db

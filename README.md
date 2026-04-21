@@ -182,7 +182,7 @@ VindexLLM currently implements the Gemma 3 4B architecture. The following GGUF f
 | Model | Purpose | Format | Size | Download |
 |-------|---------|--------|------|----------|
 | gemma-3-4b-it-qat-q4_0 | Inference (chat/generation) | Q4_0 | ~2.5 GB | [Download](https://huggingface.co/tinybiggames/gemma-3-4b-it-qat-q4_0-gguf/resolve/main/gemma-3-4b-it-q4_0.gguf?download=true) |
-| embeddinggemma-300M-qat-Q4_0 | Embeddings (memory/RAG) | Q4_0 | ~278 MB | [Download](https://huggingface.co/tinybiggames/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf?download=true) |
+| embeddinggemma-300M-qat-Q4_0 | Embeddings (memory/RAG) | Q4_0 | ~278 MB | [Download](https://huggingface.co/tinybiggames/embeddinggemma-300m-qat-Q8_0/resolve/main/embeddinggemma-300m-qat-Q8_0.gguf?download=true) |
 
 Both vetted models use **QAT (Quantization-Aware Training)** Q4_0 rather than post-training quantized Q4_0. With QAT, the quantization error is accounted for during training — the model learns to compensate for reduced precision, producing significantly better output quality at the same 4-bit size. This gives the smallest practical VRAM footprint while preserving quality, making it possible to run the full stack (inference + embeddings + memory/RAG) comfortably on most consumer GPUs with 4–6 GB of VRAM.
 
