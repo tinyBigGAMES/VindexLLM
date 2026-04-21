@@ -38,6 +38,12 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: rmsnorm_batch.comp & exit /b 1 )
 %GLSLC% -V rmsnorm_copy_batch.comp -o rmsnorm_copy_batch.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: rmsnorm_copy_batch.comp & exit /b 1 )
 
+%GLSLC% -V rmsnorm_add.comp -o rmsnorm_add.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: rmsnorm_add.comp & exit /b 1 )
+
+%GLSLC% -V rmsnorm_add_batch.comp -o rmsnorm_add_batch.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: rmsnorm_add_batch.comp & exit /b 1 )
+
 rem === QK-norm and RoPE ===
 %GLSLC% -V qk_norm.comp -o qk_norm.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: qk_norm.comp & exit /b 1 )
@@ -120,6 +126,18 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: attn_scores_mh_tq3.comp & exit /b 1 )
 rem === Activation and residual ===
 %GLSLC% -V gelu_mul.comp -o gelu_mul.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: gelu_mul.comp & exit /b 1 )
+
+%GLSLC% -V matvec_fused_gateup_q4_0.comp -o matvec_fused_gateup_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: matvec_fused_gateup_q4_0.comp & exit /b 1 )
+
+%GLSLC% -V matmul_fused_gateup_q4_0.comp -o matmul_fused_gateup_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: matmul_fused_gateup_q4_0.comp & exit /b 1 )
+
+%GLSLC% -V matvec_fused_qkv_q4_0.comp -o matvec_fused_qkv_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: matvec_fused_qkv_q4_0.comp & exit /b 1 )
+
+%GLSLC% -V matmul_fused_qkv_q4_0.comp -o matmul_fused_qkv_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: matmul_fused_qkv_q4_0.comp & exit /b 1 )
 
 %GLSLC% -V vec_add.comp -o vec_add.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: vec_add.comp & exit /b 1 )

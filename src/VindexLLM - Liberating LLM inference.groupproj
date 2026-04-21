@@ -1,6 +1,6 @@
 ﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
-        <ProjectGuid>{0546100D-1B69-4D65-A811-06847C679BB5}</ProjectGuid>
+        <ProjectGuid>{E6077042-6C23-4674-ABBF-9E1E26CCA619}</ProjectGuid>
     </PropertyGroup>
     <ItemGroup>
         <Projects Include="..\testbed\VdxTestbed.dproj">
