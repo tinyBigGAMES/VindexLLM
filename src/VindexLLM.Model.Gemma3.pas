@@ -210,7 +210,7 @@ procedure TVdxGemma3Model.RunLayerForward(const ALayer: Integer;
 var
   LTheta: Single;
   LGeluPush: TVdxGeluMulPush;
-  LVecAddPush: TVdxVecAddPush;
+  LFusedPush: TVdxFusedGateUpPush;
 begin
   // === Attention branch: x = x + PostAttnNorm(Attn(PreAttnNorm(x))) ===
 
@@ -233,17 +233,9 @@ begin
     LTheta,
     FAttnOutBuf);
 
-  // PostAttnNorm on attention output
-  FNorm.Apply(FAttnOutBuf,
-    FNormWeights[ALayer].PostAttnNormGpu, FHiddenDim);
-  FCompute.BatchBarrier();
-
-  // GPU vec_add: residual += attn_output
-  LVecAddPush.Count := FHiddenDim;
-  FCompute.DispatchComputeWithPush(
-    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
-    FVecAddAttnDescSet, @LVecAddPush, SizeOf(LVecAddPush),
-    (FHiddenDim + 255) div 256);
+  // PostAttnNorm + residual add (fused: norm attn output, add to residual)
+  FNorm.ApplyAdd(FAttnOutBuf,
+    FNormWeights[ALayer].PostAttnNormGpu, FResidualGpu, FHiddenDim);
   FCompute.BatchBarrier();
 
   // === FFN branch: x = x + PostFFNNorm(FFN(PreFFNNorm(x))) ===
@@ -253,39 +245,45 @@ begin
     FWorkBufA, FHiddenDim);
   FCompute.BatchBarrier();
 
-  // gate(x) → FGateBuf [FFNWidth]
-  FAttn.TestMatVec(FFFN.GetLayer(ALayer).GateGpuBuffer,
-    FWorkBufA, FGateBuf, FHiddenDim, FFFNWidth, FWeightType);
+  // gate(x) * GELU, up(x) → FGateBuf [FFNWidth]
+  if FWeightType = gtQ4_0 then
+  begin
+    // Fused gate+up+GELU*mul: single dispatch
+    LFusedPush.InDim := FHiddenDim;
+    LFusedPush.OutDim := FFFNWidth;
+    FCompute.UpdateDescriptorSetBuffers(FFusedGateUpDescSet,
+      [FFFN.GetLayer(ALayer).GateGpuBuffer, FUpWeights[ALayer],
+       FWorkBufA, FGateBuf]);
+    FCompute.DispatchComputeWithPush(
+      FFusedGateUpBundle.Pipeline, FFusedGateUpBundle.PipelineLayout,
+      FFusedGateUpDescSet, @LFusedPush, SizeOf(LFusedPush), FFFNWidth);
+    FCompute.BatchBarrier();
+  end
+  else
+  begin
+    // Fallback: separate gate + up + gelu_mul
+    FAttn.TestMatVec(FFFN.GetLayer(ALayer).GateGpuBuffer,
+      FWorkBufA, FGateBuf, FHiddenDim, FFFNWidth, FWeightType);
+    FAttn.TestMatVec(FUpWeights[ALayer],
+      FWorkBufA, FUpBuf, FHiddenDim, FFFNWidth, FWeightType);
+    FCompute.BatchBarrier();
 
-  // up(x) → FUpBuf [FFNWidth]
-  FAttn.TestMatVec(FUpWeights[ALayer],
-    FWorkBufA, FUpBuf, FHiddenDim, FFFNWidth, FWeightType);
-  FCompute.BatchBarrier();
-
-  // GELU(gate) * up → FGateBuf [FFNWidth] in-place
-  LGeluPush.Count := FFFNWidth;
-  FCompute.DispatchComputeWithPush(
-    FGeluMulBundle.Pipeline, FGeluMulBundle.PipelineLayout,
-    FGeluMulDescSet, @LGeluPush, SizeOf(LGeluPush),
-    (FFFNWidth + 255) div 256);
-  FCompute.BatchBarrier();
+    LGeluPush.Count := FFFNWidth;
+    FCompute.DispatchComputeWithPush(
+      FGeluMulBundle.Pipeline, FGeluMulBundle.PipelineLayout,
+      FGeluMulDescSet, @LGeluPush, SizeOf(LGeluPush),
+      (FFFNWidth + 255) div 256);
+    FCompute.BatchBarrier();
+  end;
 
   // down(hidden) → FFFNOutBuf [HiddenDim]
   FAttn.TestMatVec(FFFN.GetLayer(ALayer).DownGpuBuffer,
     FGateBuf, FFFNOutBuf, FFFNWidth, FHiddenDim, FWeightType);
   FCompute.BatchBarrier();
 
-  // PostFFNNorm on FFN output
-  FNorm.Apply(FFFNOutBuf,
-    FNormWeights[ALayer].PostFFNNormGpu, FHiddenDim);
-  FCompute.BatchBarrier();
-
-  // GPU vec_add: residual += ffn_output
-  LVecAddPush.Count := FHiddenDim;
-  FCompute.DispatchComputeWithPush(
-    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
-    FVecAddFFNDescSet, @LVecAddPush, SizeOf(LVecAddPush),
-    (FHiddenDim + 255) div 256);
+  // PostFFNNorm + residual add (fused: norm FFN output, add to residual)
+  FNorm.ApplyAdd(FFFNOutBuf,
+    FNormWeights[ALayer].PostFFNNormGpu, FResidualGpu, FHiddenDim);
   FCompute.BatchBarrier();
 end;
 
@@ -295,7 +293,7 @@ procedure TVdxGemma3Model.RunLayerForwardBatch(const ALayer: Integer;
 var
   LTheta: Single;
   LGeluPush: TVdxGeluMulPush;
-  LVecAddPush: TVdxVecAddPush;
+  LFusedBatchPush: TVdxFusedGateUpBatchPush;
 begin
   // === Attention branch ===
 
@@ -312,17 +310,10 @@ begin
     ALayer, ANumTokens, AStartPos, LTheta,
     FQMat, FKMat, FVMat, FAttnOutMatBuf, ABidirectional);
 
-  // PostAttnNorm batch
-  FNorm.ApplyBatch(FAttnOutMatBuf,
-    FNormWeights[ALayer].PostAttnNormGpu, FHiddenDim, ANumTokens);
-  FCompute.BatchBarrier();
-
-  // Vec-add batch: FResidualMat += FAttnOutMatBuf
-  LVecAddPush.Count := ANumTokens * FHiddenDim;
-  FCompute.DispatchComputeWithPush(
-    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
-    FBatchVecAddAttnDescSet, @LVecAddPush, SizeOf(LVecAddPush),
-    (ANumTokens * FHiddenDim + 255) div 256);
+  // PostAttnNorm + residual add (fused batch)
+  FNorm.ApplyAddBatch(FAttnOutMatBuf,
+    FNormWeights[ALayer].PostAttnNormGpu, FResidualMat,
+    FHiddenDim, ANumTokens);
   FCompute.BatchBarrier();
 
   // === FFN branch ===
@@ -332,39 +323,48 @@ begin
     FWorkMat, FHiddenDim, ANumTokens);
   FCompute.BatchBarrier();
 
-  // Gate matmul: FWorkMat → FGateMat
-  FAttn.BatchMatMul(FFFN.GetLayer(ALayer).GateGpuBuffer,
-    FWorkMat, FGateMat, FHiddenDim, FFFNWidth, ANumTokens, FWeightType);
+  // gate(x) * GELU, up(x) → FGateMat
+  if FWeightType = gtQ4_0 then
+  begin
+    // Fused gate+up+GELU*mul batch: single dispatch
+    LFusedBatchPush.InDim := FHiddenDim;
+    LFusedBatchPush.OutDim := FFFNWidth;
+    LFusedBatchPush.NumTokens := ANumTokens;
+    FCompute.UpdateDescriptorSetBuffers(FFusedGateUpBatchDescSet,
+      [FFFN.GetLayer(ALayer).GateGpuBuffer, FUpWeights[ALayer],
+       FWorkMat, FGateMat]);
+    FCompute.DispatchComputeWithPush(
+      FFusedGateUpBatchBundle.Pipeline, FFusedGateUpBatchBundle.PipelineLayout,
+      FFusedGateUpBatchDescSet, @LFusedBatchPush, SizeOf(LFusedBatchPush),
+      FFFNWidth, ANumTokens);
+    FCompute.BatchBarrier();
+  end
+  else
+  begin
+    // Fallback: separate gate + up + gelu_mul
+    FAttn.BatchMatMul(FFFN.GetLayer(ALayer).GateGpuBuffer,
+      FWorkMat, FGateMat, FHiddenDim, FFFNWidth, ANumTokens, FWeightType);
+    FAttn.BatchMatMul(FUpWeights[ALayer],
+      FWorkMat, FUpMatBuf, FHiddenDim, FFFNWidth, ANumTokens, FWeightType);
+    FCompute.BatchBarrier();
 
-  // Up matmul: FWorkMat → FUpMatBuf
-  FAttn.BatchMatMul(FUpWeights[ALayer],
-    FWorkMat, FUpMatBuf, FHiddenDim, FFFNWidth, ANumTokens, FWeightType);
-  FCompute.BatchBarrier();
-
-  // GELU-mul batch
-  LGeluPush.Count := ANumTokens * FFFNWidth;
-  FCompute.DispatchComputeWithPush(
-    FGeluMulBundle.Pipeline, FGeluMulBundle.PipelineLayout,
-    FBatchGeluMulDescSet, @LGeluPush, SizeOf(LGeluPush),
-    (ANumTokens * FFFNWidth + 255) div 256);
-  FCompute.BatchBarrier();
+    LGeluPush.Count := ANumTokens * FFFNWidth;
+    FCompute.DispatchComputeWithPush(
+      FGeluMulBundle.Pipeline, FGeluMulBundle.PipelineLayout,
+      FBatchGeluMulDescSet, @LGeluPush, SizeOf(LGeluPush),
+      (ANumTokens * FFFNWidth + 255) div 256);
+    FCompute.BatchBarrier();
+  end;
 
   // Down matmul: FGateMat → FFFNOutMat
   FAttn.BatchMatMul(FFFN.GetLayer(ALayer).DownGpuBuffer,
     FGateMat, FFFNOutMat, FFFNWidth, FHiddenDim, ANumTokens, FWeightType);
   FCompute.BatchBarrier();
 
-  // PostFFNNorm batch
-  FNorm.ApplyBatch(FFFNOutMat,
-    FNormWeights[ALayer].PostFFNNormGpu, FHiddenDim, ANumTokens);
-  FCompute.BatchBarrier();
-
-  // Vec-add batch: FResidualMat += FFFNOutMat
-  LVecAddPush.Count := ANumTokens * FHiddenDim;
-  FCompute.DispatchComputeWithPush(
-    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
-    FBatchVecAddFFNDescSet, @LVecAddPush, SizeOf(LVecAddPush),
-    (ANumTokens * FHiddenDim + 255) div 256);
+  // PostFFNNorm + residual add (fused batch)
+  FNorm.ApplyAddBatch(FFFNOutMat,
+    FNormWeights[ALayer].PostFFNNormGpu, FResidualMat,
+    FHiddenDim, ANumTokens);
   FCompute.BatchBarrier();
 end;
 

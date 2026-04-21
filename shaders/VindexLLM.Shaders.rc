@@ -15,6 +15,10 @@ MATMUL_Q4_0             RCDATA "matmul_q4_0.spv"
 RMSNORM                 RCDATA "rmsnorm.spv"
 RMSNORM_COPY            RCDATA "rmsnorm_copy.spv"
 
+// RMSNorm (fused norm + residual add)
+RMSNORM_ADD             RCDATA "rmsnorm_add.spv"
+RMSNORM_ADD_BATCH       RCDATA "rmsnorm_add_batch.spv"
+
 // RMSNorm (batched prefill)
 RMSNORM_BATCH           RCDATA "rmsnorm_batch.spv"
 RMSNORM_COPY_BATCH      RCDATA "rmsnorm_copy_batch.spv"
@@ -62,6 +66,14 @@ ATTN_SCORES_MH_TQ3          RCDATA "attn_scores_mh_tq3.spv"
 // Activation and residual
 GELU_MUL                RCDATA "gelu_mul.spv"
 VEC_ADD                 RCDATA "vec_add.spv"
+
+// Fused gate+up+GELU*mul (Q4_0)
+MATVEC_FUSED_GATEUP_Q4_0  RCDATA "matvec_fused_gateup_q4_0.spv"
+MATMUL_FUSED_GATEUP_Q4_0  RCDATA "matmul_fused_gateup_q4_0.spv"
+
+// Fused Q+K+V projections (Q4_0)
+MATVEC_FUSED_QKV_Q4_0     RCDATA "matvec_fused_qkv_q4_0.spv"
+MATMUL_FUSED_QKV_Q4_0     RCDATA "matmul_fused_qkv_q4_0.spv"
 
 // Streaming PoC
 CHECKSUM                RCDATA "checksum.spv"

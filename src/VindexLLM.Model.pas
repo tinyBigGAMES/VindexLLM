@@ -42,6 +42,19 @@ type
     Count: UInt32;
   end;
 
+  { TVdxFusedGateUpPush — matvec (single token) }
+  TVdxFusedGateUpPush = record
+    InDim: UInt32;
+    OutDim: UInt32;
+  end;
+
+  { TVdxFusedGateUpBatchPush — matmul (batched prefill) }
+  TVdxFusedGateUpBatchPush = record
+    InDim: UInt32;
+    OutDim: UInt32;
+    NumTokens: UInt32;
+  end;
+
   { TVdxEmbedLookupPush }
   TVdxEmbedLookupPush = record
     TokenId: UInt32;
@@ -107,6 +120,19 @@ type
     FGeluMulDescLayout: VkDescriptorSetLayout;
     FGeluMulDescPool: VkDescriptorPool;
     FGeluMulDescSet: VkDescriptorSet;
+
+    // Fused gate+up+GELU*mul pipeline (Q4_0 only)
+    FFusedGateUpShader: VkShaderModule;
+    FFusedGateUpBundle: TVdxComputePipelineBundle;
+    FFusedGateUpDescLayout: VkDescriptorSetLayout;
+    FFusedGateUpDescPool: VkDescriptorPool;
+    FFusedGateUpDescSet: VkDescriptorSet;
+
+    // Fused gate+up+GELU*mul batch pipeline (Q4_0 only)
+    FFusedGateUpBatchShader: VkShaderModule;
+    FFusedGateUpBatchBundle: TVdxComputePipelineBundle;
+    FFusedGateUpBatchDescPool: VkDescriptorPool;
+    FFusedGateUpBatchDescSet: VkDescriptorSet;
 
     // Vec-add pipeline
     FVecAddShader: VkShaderModule;
@@ -575,8 +601,10 @@ function TVdxModel.BuildDecodeResources(): Boolean;
 var
   LBufSize: UInt64;
   LSpvData: TBytes;
+  LDummyBuf: TVdxGpuBuffer;
 begin
   Result := False;
+  LDummyBuf := Default(TVdxGpuBuffer);
   LBufSize := UInt64(FHiddenDim) * SizeOf(Single);
 
   // GPU residual — host-visible for initial embed upload
@@ -621,6 +649,19 @@ begin
   FGeluMulDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
   FGeluMulDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FGeluMulDescPool, FGeluMulDescLayout, [FGateBuf, FUpBuf]);
+
+  // --- Fused gate+up+GELU*mul pipeline (Q4_0 single-token) ---
+  LSpvData := VdxLoadShader('MATVEC_FUSED_GATEUP_Q4_0');
+  FFusedGateUpShader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+  FFusedGateUpDescLayout := FCompute.CreateStorageDescriptorSetLayout(4);
+  FFusedGateUpBundle := FCompute.CreateComputePipelineWithPush(
+    FFusedGateUpShader, 'main', FFusedGateUpDescLayout,
+    SizeOf(TVdxFusedGateUpPush));
+  FFusedGateUpDescPool := FCompute.CreateDescriptorPoolForStorage(1, 4);
+  FFusedGateUpDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FFusedGateUpDescPool, FFusedGateUpDescLayout,
+    [LDummyBuf, LDummyBuf, FWorkBufA, FGateBuf]);
 
   if FErrors.HasFatal() then Exit;
 
@@ -694,6 +735,29 @@ begin
   begin
     FCompute.DestroyShaderModuleHandle(FGeluMulShader);
     FGeluMulShader := VK_NULL_HANDLE;
+  end;
+
+  // Fused gate+up+GELU*mul pipeline
+  if FFusedGateUpDescPool <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FFusedGateUpDescPool);
+    FFusedGateUpDescPool := VK_NULL_HANDLE;
+    FFusedGateUpDescSet := VK_NULL_HANDLE;
+  end;
+  if FFusedGateUpBundle.Pipeline <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyComputePipelineBundle(FFusedGateUpBundle);
+    FFusedGateUpBundle := Default(TVdxComputePipelineBundle);
+  end;
+  if FFusedGateUpDescLayout <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorSetLayoutHandle(FFusedGateUpDescLayout);
+    FFusedGateUpDescLayout := VK_NULL_HANDLE;
+  end;
+  if FFusedGateUpShader <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyShaderModuleHandle(FFusedGateUpShader);
+    FFusedGateUpShader := VK_NULL_HANDLE;
   end;
 
   // Vec-add pipeline
@@ -798,8 +862,10 @@ end;
 function TVdxModel.BuildBatchResources(): Boolean;
 var
   LSpvData: TBytes;
+  LDummyBuf: TVdxGpuBuffer;
 begin
   Result := False;
+  LDummyBuf := Default(TVdxGpuBuffer);
 
   // Single-token embed desc set (needs FEmbedGpu)
   FEmbedDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
@@ -895,6 +961,18 @@ begin
   FBatchGeluMulDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FBatchEWDescPool, FGeluMulDescLayout, [FGateMat, FUpMatBuf]);
 
+  // Fused gate+up+GELU*mul batch pipeline (Q4_0)
+  LSpvData := VdxLoadShader('MATMUL_FUSED_GATEUP_Q4_0');
+  FFusedGateUpBatchShader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+  FFusedGateUpBatchBundle := FCompute.CreateComputePipelineWithPush(
+    FFusedGateUpBatchShader, 'main', FFusedGateUpDescLayout,
+    SizeOf(TVdxFusedGateUpBatchPush));
+  FFusedGateUpBatchDescPool := FCompute.CreateDescriptorPoolForStorage(1, 4);
+  FFusedGateUpBatchDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FFusedGateUpBatchDescPool, FFusedGateUpDescLayout,
+    [LDummyBuf, LDummyBuf, FWorkMat, FGateMat]);
+
   if FErrors.HasFatal() then Exit;
 
   // Logits buffer: F32 x VocabSize, host-visible for CPU sampling
@@ -969,6 +1047,24 @@ begin
   begin
     FCompute.DestroyGpuBuffer(FTokenIdsGpu);
     FTokenIdsGpu := Default(TVdxGpuBuffer);
+  end;
+
+  // Fused gate+up batch pipeline
+  if FFusedGateUpBatchDescPool <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FFusedGateUpBatchDescPool);
+    FFusedGateUpBatchDescPool := VK_NULL_HANDLE;
+    FFusedGateUpBatchDescSet := VK_NULL_HANDLE;
+  end;
+  if FFusedGateUpBatchBundle.Pipeline <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyComputePipelineBundle(FFusedGateUpBatchBundle);
+    FFusedGateUpBatchBundle := Default(TVdxComputePipelineBundle);
+  end;
+  if FFusedGateUpBatchShader <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyShaderModuleHandle(FFusedGateUpBatchShader);
+    FFusedGateUpBatchShader := VK_NULL_HANDLE;
   end;
 
   // Batch elementwise desc pool
