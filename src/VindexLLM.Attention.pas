@@ -172,6 +172,21 @@ type
     SeqLen: UInt32;
   end;
 
+  { TVdxFusedQKVPush — fused Q+K+V matvec (single token, Q4_0) }
+  TVdxFusedQKVPush = record
+    InDim: UInt32;
+    QOutDim: UInt32;
+    KVOutDim: UInt32;
+  end;
+
+  { TVdxFusedQKVBatchPush — fused Q+K+V matmul (batch, Q4_0) }
+  TVdxFusedQKVBatchPush = record
+    InDim: UInt32;
+    QOutDim: UInt32;
+    KVOutDim: UInt32;
+    NumTokens: UInt32;
+  end;
+
   { TVdxAttnLayerWeights }
   TVdxAttnLayerWeights = record
     QWeightGpu: TVdxGpuBuffer;   // F16 or Q4_0 [2560 x 2048] = Q projection
@@ -228,6 +243,19 @@ type
     FKVStoreDescLayout: VkDescriptorSetLayout;  // 4 bindings
     FKVStoreDescPool: VkDescriptorPool;
     FKVStoreDescSet: VkDescriptorSet;
+
+    // Fused Q+K+V projection (Q4_0 single-token)
+    FFusedQKVShader: VkShaderModule;
+    FFusedQKVBundle: TVdxComputePipelineBundle;
+    FFusedQKVDescLayout: VkDescriptorSetLayout;  // 7 bindings
+    FFusedQKVDescPool: VkDescriptorPool;
+    FFusedQKVDescSet: VkDescriptorSet;
+
+    // Fused Q+K+V projection (Q4_0 batch)
+    FFusedQKVBatchShader: VkShaderModule;
+    FFusedQKVBatchBundle: TVdxComputePipelineBundle;
+    FFusedQKVBatchDescPool: VkDescriptorPool;
+    FFusedQKVBatchDescSet: VkDescriptorSet;
 
     // Batch matmul shaders + pipelines (prefill batching — Phase 6D)
     FMatMulF16Shader: VkShaderModule;
@@ -454,6 +482,18 @@ begin
   FKVStoreDescPool := VK_NULL_HANDLE;
   FKVStoreDescSet := VK_NULL_HANDLE;
 
+  FFusedQKVShader := VK_NULL_HANDLE;
+  FFusedQKVBundle.Pipeline := VK_NULL_HANDLE;
+  FFusedQKVBundle.PipelineLayout := VK_NULL_HANDLE;
+  FFusedQKVDescLayout := VK_NULL_HANDLE;
+  FFusedQKVDescPool := VK_NULL_HANDLE;
+  FFusedQKVDescSet := VK_NULL_HANDLE;
+  FFusedQKVBatchShader := VK_NULL_HANDLE;
+  FFusedQKVBatchBundle.Pipeline := VK_NULL_HANDLE;
+  FFusedQKVBatchBundle.PipelineLayout := VK_NULL_HANDLE;
+  FFusedQKVBatchDescPool := VK_NULL_HANDLE;
+  FFusedQKVBatchDescSet := VK_NULL_HANDLE;
+
   FMatMulF16Shader := VK_NULL_HANDLE;
   FMatMulQ8Shader := VK_NULL_HANDLE;
   FMatMulQ4Shader := VK_NULL_HANDLE;
@@ -673,6 +713,28 @@ begin
     FKVStoreDescPool, FKVStoreDescLayout,
     [LDummyBuf, LDummyBuf, LDummyBuf, LDummyBuf]);
 
+  // Fused Q+K+V projection (Q4_0 single-token)
+  FFusedQKVShader := LoadShader('MATVEC_FUSED_QKV_Q4_0');
+  FFusedQKVDescLayout := FCompute.CreateStorageDescriptorSetLayout(7);
+  FFusedQKVBundle := FCompute.CreateComputePipelineWithPush(
+    FFusedQKVShader, 'main', FFusedQKVDescLayout, SizeOf(TVdxFusedQKVPush));
+  FFusedQKVDescPool := FCompute.CreateDescriptorPoolForStorage(1, 7);
+  FFusedQKVDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FFusedQKVDescPool, FFusedQKVDescLayout,
+    [LDummyBuf, LDummyBuf, LDummyBuf, LDummyBuf,
+     LDummyBuf, LDummyBuf, LDummyBuf]);
+
+  // Fused Q+K+V projection (Q4_0 batch)
+  FFusedQKVBatchShader := LoadShader('MATMUL_FUSED_QKV_Q4_0');
+  FFusedQKVBatchBundle := FCompute.CreateComputePipelineWithPush(
+    FFusedQKVBatchShader, 'main', FFusedQKVDescLayout,
+    SizeOf(TVdxFusedQKVBatchPush));
+  FFusedQKVBatchDescPool := FCompute.CreateDescriptorPoolForStorage(1, 7);
+  FFusedQKVBatchDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FFusedQKVBatchDescPool, FFusedQKVDescLayout,
+    [LDummyBuf, LDummyBuf, LDummyBuf, LDummyBuf,
+     LDummyBuf, LDummyBuf, LDummyBuf]);
+
   // Batch matmul shaders + pipelines (Phase 6D — prefill batching)
   // Reuse FMatVecDescLayout (3 storage bindings: weight, input, output)
   FMatMulF16Shader := LoadShader('MATMUL_F16');
@@ -825,6 +887,17 @@ begin
     FCompute.DestroyDescriptorPoolHandle(FKVStoreDescPool);
   FCompute.DestroyDescriptorSetLayoutHandle(FKVStoreDescLayout);
   FCompute.DestroyShaderModuleHandle(FKVStoreShader);
+
+  // Destroy fused Q+K+V resources
+  FCompute.DestroyComputePipelineBundle(FFusedQKVBundle);
+  if FFusedQKVDescPool <> VK_NULL_HANDLE then
+    FCompute.DestroyDescriptorPoolHandle(FFusedQKVDescPool);
+  FCompute.DestroyDescriptorSetLayoutHandle(FFusedQKVDescLayout);
+  FCompute.DestroyShaderModuleHandle(FFusedQKVShader);
+  FCompute.DestroyComputePipelineBundle(FFusedQKVBatchBundle);
+  if FFusedQKVBatchDescPool <> VK_NULL_HANDLE then
+    FCompute.DestroyDescriptorPoolHandle(FFusedQKVBatchDescPool);
+  FCompute.DestroyShaderModuleHandle(FFusedQKVBatchShader);
 
   // Destroy batch matmul pipelines + shaders (Phase 6D)
   FCompute.DestroyComputePipelineBundle(FMatMulF16Bundle);
@@ -1034,19 +1107,36 @@ var
   LSoftmaxPush: TVdxSoftmaxPrefillPush;
   LValuePush: TVdxAttnValuePrefillPush;
   LScoresBundle: TVdxComputePipelineBundle;
+  LFusedQKVBatchPush: TVdxFusedQKVBatchPush;
 begin
   // Total keys in the filled cache after this batch writes its tokens.
-  // Prefill dispatches and shader indexing must cover this range, not
-  // just the current batch's own tokens.
   LSeqLen := AStartPos + ANumTokens;
 
   // ---- Step 1: Q/K/V projections (batch matmul) ----
-  DispatchBatchMatMul(AWeights.QWeightGpu, AInputMat, AQMat,
-    FHiddenDim, FNumQHeads * FHeadDim, ANumTokens, AWeights.WeightType);
-  DispatchBatchMatMul(AWeights.KWeightGpu, AInputMat, AKMat,
-    FHiddenDim, FNumKVHeads * FHeadDim, ANumTokens, AWeights.WeightType);
-  DispatchBatchMatMul(AWeights.VWeightGpu, AInputMat, AVMat,
-    FHiddenDim, FNumKVHeads * FHeadDim, ANumTokens, AWeights.WeightType);
+  if AWeights.WeightType = gtQ4_0 then
+  begin
+    // Fused Q+K+V batch: single dispatch
+    LFusedQKVBatchPush.InDim := FHiddenDim;
+    LFusedQKVBatchPush.QOutDim := FNumQHeads * FHeadDim;
+    LFusedQKVBatchPush.KVOutDim := FNumKVHeads * FHeadDim;
+    LFusedQKVBatchPush.NumTokens := ANumTokens;
+    FCompute.UpdateDescriptorSetBuffers(FFusedQKVBatchDescSet,
+      [AWeights.QWeightGpu, AWeights.KWeightGpu, AWeights.VWeightGpu,
+       AInputMat, AQMat, AKMat, AVMat]);
+    FCompute.DispatchComputeWithPush(
+      FFusedQKVBatchBundle.Pipeline, FFusedQKVBatchBundle.PipelineLayout,
+      FFusedQKVBatchDescSet, @LFusedQKVBatchPush, SizeOf(LFusedQKVBatchPush),
+      FNumQHeads * FHeadDim, ANumTokens);
+  end
+  else
+  begin
+    DispatchBatchMatMul(AWeights.QWeightGpu, AInputMat, AQMat,
+      FHiddenDim, FNumQHeads * FHeadDim, ANumTokens, AWeights.WeightType);
+    DispatchBatchMatMul(AWeights.KWeightGpu, AInputMat, AKMat,
+      FHiddenDim, FNumKVHeads * FHeadDim, ANumTokens, AWeights.WeightType);
+    DispatchBatchMatMul(AWeights.VWeightGpu, AInputMat, AVMat,
+      FHiddenDim, FNumKVHeads * FHeadDim, ANumTokens, AWeights.WeightType);
+  end;
   FCompute.BatchBarrier(); // Q/K/V matrices ready
 
   // ---- Step 2: QK-norm (reuse existing shader with NumHeads * NumTokens) ----
@@ -1355,17 +1445,34 @@ var
   LTQ3QuantPush: TVdxTQ3KVQuantPush;
   LTQ3DequantPush: TVdxTQ3KVDequantPush;
   LScoresMHTQ3Push: TVdxAttnScoresMHTQ3Push;
+  LFusedQKVPush: TVdxFusedQKVPush;
 begin
   LSeqLen := UInt32(APosition) + 1;
 
-  // ---- Step 1: Q/K/V projections (matvec — F16 or Q4_0) ----
-  // All three read AInputBuf and write separate output buffers → independent
-  DispatchMatVec(AWeights.QWeightGpu, AInputBuf, FQBuf,
-    FHiddenDim, FNumQHeads * FHeadDim, AWeights.WeightType);
-  DispatchMatVec(AWeights.KWeightGpu, AInputBuf, FKBuf,
-    FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
-  DispatchMatVec(AWeights.VWeightGpu, AInputBuf, FVBuf,
-    FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
+  // ---- Step 1: Q/K/V projections ----
+  if AWeights.WeightType = gtQ4_0 then
+  begin
+    // Fused Q+K+V: single dispatch, input read once
+    LFusedQKVPush.InDim := FHiddenDim;
+    LFusedQKVPush.QOutDim := FNumQHeads * FHeadDim;
+    LFusedQKVPush.KVOutDim := FNumKVHeads * FHeadDim;
+    FCompute.UpdateDescriptorSetBuffers(FFusedQKVDescSet,
+      [AWeights.QWeightGpu, AWeights.KWeightGpu, AWeights.VWeightGpu,
+       AInputBuf, FQBuf, FKBuf, FVBuf]);
+    FCompute.DispatchComputeWithPush(
+      FFusedQKVBundle.Pipeline, FFusedQKVBundle.PipelineLayout,
+      FFusedQKVDescSet, @LFusedQKVPush, SizeOf(LFusedQKVPush),
+      FNumQHeads * FHeadDim);
+  end
+  else
+  begin
+    DispatchMatVec(AWeights.QWeightGpu, AInputBuf, FQBuf,
+      FHiddenDim, FNumQHeads * FHeadDim, AWeights.WeightType);
+    DispatchMatVec(AWeights.KWeightGpu, AInputBuf, FKBuf,
+      FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
+    DispatchMatVec(AWeights.VWeightGpu, AInputBuf, FVBuf,
+      FHiddenDim, FNumKVHeads * FHeadDim, AWeights.WeightType);
+  end;
   FCompute.BatchBarrier(); // Q/K/VBuf ready for QK-norm
 
   // ---- Step 2: QK-norm on Q (8 heads) and K (4 heads) ----

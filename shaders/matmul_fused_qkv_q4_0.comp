@@ -1,0 +1,104 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Fused Q+K+V MatMul (Q4_0) — batched prefill
+//
+// Dispatch: 2D — (q_out_dim, num_tokens, 1)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_dim;
+    uint q_out_dim;
+    uint kv_out_dim;
+    uint num_tokens;
+} pc;
+
+layout(std430, binding = 0) readonly buffer QWeightBuf { uint8_t q_bytes[]; };
+layout(std430, binding = 1) readonly buffer KWeightBuf { uint8_t k_bytes[]; };
+layout(std430, binding = 2) readonly buffer VWeightBuf { uint8_t v_bytes[]; };
+layout(std430, binding = 3) readonly buffer InputBuf   { float input_mat[]; };
+layout(std430, binding = 4) writeonly buffer QOutBuf   { float q_out[]; };
+layout(std430, binding = 5) writeonly buffer KOutBuf   { float k_out[]; };
+layout(std430, binding = 6) writeonly buffer VOutBuf   { float v_out[]; };
+
+shared float partial_q[64];
+shared float partial_k[64];
+shared float partial_v[64];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= pc.q_out_dim || tok >= pc.num_tokens)
+        return;
+
+    bool do_kv = (row < pc.kv_out_dim);
+    uint blocks_per_row = pc.in_dim >> 5;
+    uint row_byte_off = row * blocks_per_row * 18u;
+    uint input_base = tok * pc.in_dim;
+
+    float q_acc = 0.0;
+    float k_acc = 0.0;
+    float v_acc = 0.0;
+
+    for (uint elem = tid; elem < pc.in_dim; elem += 64) {
+        uint blk_idx  = elem >> 5;
+        uint in_blk   = elem & 31u;
+        uint byte_idx = in_blk & 15u;
+        uint is_high  = in_blk >> 4;
+        uint blk_off  = row_byte_off + blk_idx * 18u;
+        uint qs_off   = blk_off + 2u + byte_idx;
+
+        float x = input_mat[input_base + elem];
+
+        uint qs_lo   = uint(q_bytes[blk_off]) & 0xFFu;
+        uint qs_hi   = uint(q_bytes[blk_off + 1u]) & 0xFFu;
+        float qscale = unpackHalf2x16(qs_lo | (qs_hi << 8)).x;
+        uint qraw    = uint(q_bytes[qs_off]) & 0xFFu;
+        uint qnib    = (qraw >> (is_high * 4u)) & 0x0Fu;
+        q_acc += float(int(qnib) - 8) * qscale * x;
+
+        if (do_kv) {
+            uint ks_lo   = uint(k_bytes[blk_off]) & 0xFFu;
+            uint ks_hi   = uint(k_bytes[blk_off + 1u]) & 0xFFu;
+            float kscale = unpackHalf2x16(ks_lo | (ks_hi << 8)).x;
+            uint kraw    = uint(k_bytes[qs_off]) & 0xFFu;
+            uint knib    = (kraw >> (is_high * 4u)) & 0x0Fu;
+            k_acc += float(int(knib) - 8) * kscale * x;
+
+            uint vs_lo   = uint(v_bytes[blk_off]) & 0xFFu;
+            uint vs_hi   = uint(v_bytes[blk_off + 1u]) & 0xFFu;
+            float vscale = unpackHalf2x16(vs_lo | (vs_hi << 8)).x;
+            uint vraw    = uint(v_bytes[qs_off]) & 0xFFu;
+            uint vnib    = (vraw >> (is_high * 4u)) & 0x0Fu;
+            v_acc += float(int(vnib) - 8) * vscale * x;
+        }
+    }
+
+    partial_q[tid] = q_acc;
+    partial_k[tid] = k_acc;
+    partial_v[tid] = v_acc;
+    barrier();
+
+    for (uint stride = 32; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial_q[tid] += partial_q[tid + stride];
+            if (do_kv) {
+                partial_k[tid] += partial_k[tid + stride];
+                partial_v[tid] += partial_v[tid + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        q_out[tok * pc.q_out_dim + row] = partial_q[0];
+        if (do_kv) {
+            k_out[tok * pc.kv_out_dim + row] = partial_k[0];
+            v_out[tok * pc.kv_out_dim + row] = partial_v[0];
+        }
+    }
+}
