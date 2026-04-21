@@ -4,36 +4,24 @@
 
 // MatVec Q4_0: Q4_0 weight matrix x F32 vector.
 //
-// Structurally identical to matvec_q8_0.comp -- same shared-memory scale
-// cache + per-element striding optimization. Only the block layout and
-// element-unpack differ.
-//
-// Q4_0 block format (18 bytes, 32 elements) -- verified against
-// llama.cpp master (gguf-py/gguf/quants.py, ggml-quants.c):
-//   bytes 0-1:   F16 scale factor d (may be negative; quantizer sets d = max/-8)
+// Q4_0 block format (18 bytes, 32 elements):
+//   bytes 0-1:   F16 scale factor d
 //   bytes 2-17:  16 bytes of packed nibbles qs[0..15]
 //
-// Packing is STRIDED, not interleaved:
-//   qs[j] & 0x0F        -> element at index j        (j in 0..15)
-//   (qs[j] >> 4) & 0x0F -> element at index j + 16   (j in 0..15)
+// Packing:
+//   qs[j] & 0x0F        -> element j        (j in 0..15)
+//   (qs[j] >> 4) & 0x0F -> element j + 16   (j in 0..15)
 //
-// Dequant (bias-by-8, NOT two's-complement):
-//   nibble_u = (qs_byte >> shift) & 0x0F    // 0..15 unsigned
-//   value_s  = int(nibble_u) - 8            // -8..+7 signed
-//   weight   = d * float(value_s)
+// Dequant: value = (int(nibble) - 8) * scale
 //
-// Dispatch: one workgroup per output row -> (out_dim, 1, 1) workgroups.
+// Dispatch: (out_dim, 1, 1) — one workgroup per output row.
 //
 // Bindings:
 //   0 = weight data (uint8_t[], raw Q4_0 blocks, row-major)
 //   1 = input vector (float[], in_dim elements)
 //   2 = output vector (float[], out_dim elements)
-//
-// Push constants:
-//   in_dim  = input dimension (must be multiple of 32)
-//   out_dim = output dimension
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConstants {
     uint in_dim;
@@ -52,13 +40,7 @@ layout(std430, binding = 2) writeonly buffer OutputBuf {
     float output_vec[];
 };
 
-// Reduction scratch only -- scales are streamed from global memory per
-// access, not cached. This keeps the shader dimension-agnostic (no upper
-// bound on in_dim) at the cost of re-reading each block's 2-byte scale
-// ~32 times per row. The memory controller coalesces reads from threads
-// sharing a block into a single L1 cache-line fetch, so the cost is
-// negligible on any modern GPU and matches llama.cpp's approach.
-shared float partial[256];
+shared float partial[64];
 
 void main() {
     uint row = gl_WorkGroupID.x;
@@ -67,41 +49,33 @@ void main() {
     if (row >= pc.out_dim)
         return;
 
-    uint blocks_per_row = pc.in_dim >> 5;        // in_dim / 32
+    uint blocks_per_row = pc.in_dim >> 5;
     uint row_byte_off   = row * blocks_per_row * 18u;
 
-    // Per-element streaming dot product: read scale + nibble inline for each
-    // element. No Phase 1 precache, no upper bound on in_dim.
     float acc = 0.0;
 
-    for (uint elem = tid; elem < pc.in_dim; elem += 256) {
-        uint blk_idx  = elem >> 5;               // which block
-        uint in_blk   = elem & 31u;              // 0..31 within block
-        uint byte_idx = in_blk & 15u;            // 0..15 byte position
-        uint is_high  = in_blk >> 4;             // 0 for elem 0..15, 1 for 16..31
-
-        // Block base offset: points at the 2-byte FP16 scale.
+    for (uint elem = tid; elem < pc.in_dim; elem += 64) {
+        uint blk_idx  = elem >> 5;
+        uint in_blk   = elem & 31u;
+        uint byte_idx = in_blk & 15u;
+        uint is_high  = in_blk >> 4;
         uint blk_off  = row_byte_off + blk_idx * 18u;
 
-        // Read this block's scale from global memory (coalesced across the
-        // 32 threads in the same block, cached in L1 after first access).
         uint s_lo     = uint(weight_bytes[blk_off]) & 0xFFu;
         uint s_hi     = uint(weight_bytes[blk_off + 1u]) & 0xFFu;
         float scale   = unpackHalf2x16(s_lo | (s_hi << 8)).x;
 
-        // Dequant nibble and accumulate dot product.
         uint qs_off   = blk_off + 2u + byte_idx;
         uint raw      = uint(weight_bytes[qs_off]) & 0xFFu;
         uint nibble   = (raw >> (is_high * 4u)) & 0x0Fu;
-        float qval    = float(int(nibble) - 8);  // bias-by-8 dequant
+        float qval    = float(int(nibble) - 8);
         acc += qval * scale * input_vec[elem];
     }
 
     partial[tid] = acc;
     barrier();
 
-    // Parallel reduction in shared memory
-    for (uint stride = 128; stride > 0; stride >>= 1) {
+    for (uint stride = 32; stride > 0; stride >>= 1) {
         if (tid < stride) {
             partial[tid] += partial[tid + stride];
         }

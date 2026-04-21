@@ -4,51 +4,21 @@
 
 // MatMul Q4_0 (Tiled): Q4_0 weight matrix x F32 input matrix -> F32 output matrix.
 //
-// Batched version of matvec_q4_0.comp for prefill.
-// Computes: Y[tok][row] = dot(dequant(W[row]), X[tok]) for all (row, tok) pairs.
-//
-// Q4_0 block format + dequant: see matvec_q4_0.comp header. The 18-byte
-// block layout and bias-by-8 nibble unpack are identical here.
-//
-// Input layout: row-major F32 [num_tokens x in_dim]
-// Output layout: row-major F32 [num_tokens x out_dim]
-//
-// Dispatch: 2D -- (out_dim, num_tokens, 1) workgroups
-//   gl_WorkGroupID.x = output row
-//   gl_WorkGroupID.y = token index
-//
-// Bindings:
-//   0 = weight data   (uint8_t[], raw Q4_0 blocks, row-major)
-//   1 = input matrix  (float[], num_tokens x in_dim, row-major)
-//   2 = output matrix (float[], num_tokens x out_dim, row-major)
+// Dispatch: 2D — (out_dim, num_tokens, 1)
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConstants {
-    uint in_dim;        // input dimension (must be multiple of 32)
-    uint out_dim;       // output dimension
-    uint num_tokens;    // number of tokens in batch
+    uint in_dim;
+    uint out_dim;
+    uint num_tokens;
 } pc;
 
-layout(std430, binding = 0) readonly buffer WeightBuf {
-    uint8_t weight_bytes[];
-};
+layout(std430, binding = 0) readonly buffer WeightBuf { uint8_t weight_bytes[]; };
+layout(std430, binding = 1) readonly buffer InputBuf  { float input_mat[]; };
+layout(std430, binding = 2) writeonly buffer OutputBuf { float output_mat[]; };
 
-layout(std430, binding = 1) readonly buffer InputBuf {
-    float input_mat[];
-};
-
-layout(std430, binding = 2) writeonly buffer OutputBuf {
-    float output_mat[];
-};
-
-// Reduction scratch only -- scales are streamed from global memory per
-// access, not cached. This keeps the shader dimension-agnostic (no upper
-// bound on in_dim) at the cost of re-reading each block's 2-byte scale
-// ~32 times per row. The memory controller coalesces reads from threads
-// sharing a block into a single L1 cache-line fetch, so the cost is
-// negligible on any modern GPU and matches llama.cpp's approach.
-shared float partial[256];
+shared float partial[64];
 
 void main() {
     uint row = gl_WorkGroupID.x;
@@ -62,26 +32,19 @@ void main() {
     uint row_byte_off   = row * blocks_per_row * 18u;
     uint input_base     = tok * pc.in_dim;
 
-    // Per-element streaming dot product: read scale + nibble inline for each
-    // element. No Phase 1 precache, no upper bound on in_dim.
     float acc = 0.0;
 
-    for (uint elem = tid; elem < pc.in_dim; elem += 256) {
+    for (uint elem = tid; elem < pc.in_dim; elem += 64) {
         uint blk_idx  = elem >> 5;
         uint in_blk   = elem & 31u;
         uint byte_idx = in_blk & 15u;
         uint is_high  = in_blk >> 4;
-
-        // Block base offset: points at the 2-byte FP16 scale.
         uint blk_off  = row_byte_off + blk_idx * 18u;
 
-        // Read this block's scale from global memory (coalesced across the
-        // 32 threads in the same block, cached in L1 after first access).
         uint s_lo     = uint(weight_bytes[blk_off]) & 0xFFu;
         uint s_hi     = uint(weight_bytes[blk_off + 1u]) & 0xFFu;
         float scale   = unpackHalf2x16(s_lo | (s_hi << 8)).x;
 
-        // Dequant nibble and accumulate dot product.
         uint qs_off   = blk_off + 2u + byte_idx;
         uint raw      = uint(weight_bytes[qs_off]) & 0xFFu;
         uint nibble   = (raw >> (is_high * 4u)) & 0x0Fu;
@@ -92,7 +55,7 @@ void main() {
     partial[tid] = acc;
     barrier();
 
-    for (uint stride = 128; stride > 0; stride >>= 1) {
+    for (uint stride = 32; stride > 0; stride >>= 1) {
         if (tid < stride) {
             partial[tid] += partial[tid + stride];
         }
