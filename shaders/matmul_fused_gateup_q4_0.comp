@@ -1,0 +1,83 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+// Fused Gate+Up+GELU*Mul MatMul (Q4_0) — batched prefill
+//
+// Dispatch: 2D — (out_dim, num_tokens, 1)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_dim;
+    uint out_dim;
+    uint num_tokens;
+} pc;
+
+layout(std430, binding = 0) readonly buffer GateWeightBuf { uint8_t gate_bytes[]; };
+layout(std430, binding = 1) readonly buffer UpWeightBuf   { uint8_t up_bytes[]; };
+layout(std430, binding = 2) readonly buffer InputBuf      { float input_mat[]; };
+layout(std430, binding = 3) writeonly buffer OutputBuf    { float output_mat[]; };
+
+shared float partial_gate[64];
+shared float partial_up[64];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= pc.out_dim || tok >= pc.num_tokens)
+        return;
+
+    uint blocks_per_row = pc.in_dim >> 5;
+    uint row_byte_off   = row * blocks_per_row * 18u;
+    uint input_base     = tok * pc.in_dim;
+
+    float gate_acc = 0.0;
+    float up_acc   = 0.0;
+
+    for (uint elem = tid; elem < pc.in_dim; elem += 64) {
+        uint blk_idx  = elem >> 5;
+        uint in_blk   = elem & 31u;
+        uint byte_idx = in_blk & 15u;
+        uint is_high  = in_blk >> 4;
+        uint blk_off  = row_byte_off + blk_idx * 18u;
+        uint qs_off   = blk_off + 2u + byte_idx;
+
+        float x = input_mat[input_base + elem];
+
+        uint gs_lo    = uint(gate_bytes[blk_off]) & 0xFFu;
+        uint gs_hi    = uint(gate_bytes[blk_off + 1u]) & 0xFFu;
+        float g_scale = unpackHalf2x16(gs_lo | (gs_hi << 8)).x;
+        uint g_raw    = uint(gate_bytes[qs_off]) & 0xFFu;
+        uint g_nib    = (g_raw >> (is_high * 4u)) & 0x0Fu;
+        gate_acc += float(int(g_nib) - 8) * g_scale * x;
+
+        uint us_lo    = uint(up_bytes[blk_off]) & 0xFFu;
+        uint us_hi    = uint(up_bytes[blk_off + 1u]) & 0xFFu;
+        float u_scale = unpackHalf2x16(us_lo | (us_hi << 8)).x;
+        uint u_raw    = uint(up_bytes[qs_off]) & 0xFFu;
+        uint u_nib    = (u_raw >> (is_high * 4u)) & 0x0Fu;
+        up_acc += float(int(u_nib) - 8) * u_scale * x;
+    }
+
+    partial_gate[tid] = gate_acc;
+    partial_up[tid]   = up_acc;
+    barrier();
+
+    for (uint stride = 32; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial_gate[tid] += partial_gate[tid + stride];
+            partial_up[tid]   += partial_up[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        float g = partial_gate[0];
+        float inner = 0.7978845608 * (g + 0.044715 * g * g * g);
+        float gelu_g = 0.5 * g * (1.0 + tanh(inner));
+        output_mat[tok * pc.out_dim + row] = gelu_g * partial_up[0];
+    }
+}
